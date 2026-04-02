@@ -352,10 +352,17 @@ function App() {
                 {KILL_CHAIN.map(phase => {
                   const Icon = phase.icon;
                   const isSelected = selectedPhases.includes(phase.id);
+                  const handleClick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!isScanning) {
+                      togglePhase(phase.id);
+                    }
+                  };
                   return (
-                    <div key={phase.id} onClick={() => !isScanning && togglePhase(phase.id)} className={`p-2 border cursor-pointer transition-all ${isSelected ? 'bg-[#FF003C]/10' : 'hover:bg-[#FF003C]/5'} ${isScanning ? 'opacity-50' : ''}`} style={{ borderColor: isSelected ? phase.color : 'rgba(255,0,60,0.2)' }} data-testid={`phase-${phase.id}`}>
+                    <div key={phase.id} onClick={handleClick} className={`p-2 border cursor-pointer transition-all ${isSelected ? 'bg-[#FF003C]/10' : 'hover:bg-[#FF003C]/5'} ${isScanning ? 'opacity-50' : ''}`} style={{ borderColor: isSelected ? phase.color : 'rgba(255,0,60,0.2)' }} data-testid={`phase-${phase.id}`}>
                       <div className="flex items-center gap-2">
-                        <input type="checkbox" checked={isSelected} onChange={() => {}} className="matrix-checkbox" style={{ borderColor: phase.color }} />
+                        <input type="checkbox" checked={isSelected} onChange={handleClick} className="matrix-checkbox" style={{ borderColor: phase.color }} />
                         <Icon size={14} style={{ color: phase.color }} />
                       </div>
                       <h3 className="text-xs font-bold uppercase tracking-wider mt-1" style={{ color: phase.color }}>{phase.name}</h3>
