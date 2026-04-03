@@ -252,12 +252,36 @@ function App() {
         });
         setTacticalDecisions(response.data.tactical_decisions);
       }
+      // Show adaptive decisions in terminal
+      if (response.data.adaptive_log?.length > 0) {
+        const newDecisions = response.data.adaptive_log.slice(-3);
+        newDecisions.forEach(d => {
+          if (d.decision === "SKIP") addTerminalLine("warning", `[ADAPT] SKIP: ${d.reason}`);
+          else if (d.decision === "ADD") addTerminalLine("info", `[ADAPT] +TOOL: ${d.reason}`);
+          else if (d.decision === "EXPLOIT") addTerminalLine("error", `[ADAPT] AUTO-EXPLOIT: ${d.reason}`);
+          else if (d.decision === "CHAIN_TRIGGER") addTerminalLine("error", `[ADAPT] CHAIN TRIGGERED: ${d.reason}`);
+        });
+      }
+      
       if (response.data.status === "completed") {
         clearInterval(pollIntervalRef.current);
         setIsScanning(false);
         addTerminalLine("success", "═══════════════════════════════════════════════════════");
-        addTerminalLine("success", "OPERATION COMPLETE - ATTACK TREE GENERATED");
+        addTerminalLine("success", "ADAPTIVE SCAN COMPLETE");
         addTerminalLine("success", "═══════════════════════════════════════════════════════");
+        
+        // Show vault summary
+        const vault = response.data.vault_summary;
+        if (vault) {
+          addTerminalLine("info", `[VAULT] Creds: ${vault.total_credentials || 0} (${vault.hashes || 0} hashes, ${vault.plaintext || 0} plain) | Sessions: ${vault.sessions || 0}`);
+        }
+        
+        // Show auto-triggered chain
+        if (response.data.auto_triggered_chain) {
+          const tc = response.data.auto_triggered_chain;
+          addTerminalLine("error", `[AUTO-CHAIN] ${tc.chain_id} triggered (confidence: ${(tc.confidence * 100).toFixed(0)}%)`);
+          addTerminalLine("info", `  Reason: ${tc.reason}`);
+        }
         
         // Show suggested chains
         if (response.data.suggested_chains?.length > 0) {
@@ -285,10 +309,13 @@ function App() {
     } catch (error) { console.error("Error polling:", error); }
   };
 
-  const stopScan = () => {
+  const stopScan = async () => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     setIsScanning(false);
-    addTerminalLine("warning", "Operation aborted");
+    if (currentScanId) {
+      try { await axios.post(`${API}/scan/${currentScanId}/abort`); } catch (e) {}
+    }
+    addTerminalLine("error", "═══ SCAN ABORTED ═══");
   };
 
   const updateNodeStatus = async (nodeId, status) => {
