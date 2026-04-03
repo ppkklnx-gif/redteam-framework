@@ -5,7 +5,8 @@ import {
   Shield, Radar, Bug, Globe, Crosshair, Fingerprint, Play, Square, Download, 
   Trash2, Clock, Terminal, Cpu, AlertTriangle, CheckCircle, XCircle, Copy, 
   History, ChevronRight, Zap, Target, GitBranch, Server, Unlock, Skull, 
-  RefreshCw, Eye, Database, Key, Network, Lock, Layers, Activity, Link
+  RefreshCw, Eye, Database, Key, Network, Lock, Layers, Activity, Link,
+  Radio, Wifi, Upload, Command, MonitorSmartphone
 } from "lucide-react";
 import { ScrollArea } from "./components/ui/scroll-area";
 import { Progress } from "./components/ui/progress";
@@ -77,7 +78,16 @@ function App() {
   const [chainPolling, setChainPolling] = useState(false);
   const [suggestedChains, setSuggestedChains] = useState([]);
   const [recommendedModules, setRecommendedModules] = useState([]);
+  const [c2Dashboard, setC2Dashboard] = useState(null);
+  const [c2Loading, setC2Loading] = useState(false);
+  const [msfSearchQuery, setMsfSearchQuery] = useState("");
+  const [msfRpcModules, setMsfRpcModules] = useState([]);
+  const [sliverGenConfig, setSliverGenConfig] = useState({ name: "implant", lhost: "", lport: 443, os: "linux", arch: "amd64", type: "session", protocol: "mtls" });
+  const [selectedSession, setSelectedSession] = useState(null);
+  const [sessionCmd, setSessionCmd] = useState("");
+  const [sessionOutput, setSessionOutput] = useState([]);
   const chainPollRef = useRef(null);
+  const wsRef = useRef(null);
   const terminalRef = useRef(null);
   const pollIntervalRef = useRef(null);
 
@@ -117,6 +127,76 @@ function App() {
     } catch (error) { console.error("Error loading chains:", error); }
   }, []);
 
+  const loadC2Dashboard = useCallback(async () => {
+    setC2Loading(true);
+    try {
+      const response = await axios.get(`${API}/c2/dashboard`);
+      setC2Dashboard(response.data);
+    } catch (error) { console.error("C2 dashboard error:", error); }
+    setC2Loading(false);
+  }, []);
+
+  const searchMsfRpc = async (query) => {
+    try {
+      const response = await axios.get(`${API}/msf/search`, { params: { query } });
+      setMsfRpcModules(response.data.modules || []);
+    } catch (error) { console.error("MSF RPC search error:", error); }
+  };
+
+  const executeMsfRpc = async (moduleType, moduleName, options) => {
+    addTerminalLine("command", `> msf rpc: ${moduleType}/${moduleName}`);
+    try {
+      const response = await axios.post(`${API}/msf/module/execute`, { module_type: moduleType, module_name: moduleName, options });
+      if (response.data.success) {
+        addTerminalLine("success", `Job started: ${response.data.job_id}`);
+      } else {
+        addTerminalLine("error", `Failed: ${response.data.error}`);
+      }
+      return response.data;
+    } catch (error) { addTerminalLine("error", error.message); return null; }
+  };
+
+  const runSessionCommand = async () => {
+    if (!selectedSession || !sessionCmd) return;
+    const source = selectedSession.source;
+    addTerminalLine("command", `> [${source}] ${sessionCmd}`);
+    try {
+      let response;
+      if (source === "msf") {
+        response = await axios.post(`${API}/msf/session/command`, { session_id: selectedSession.id, command: sessionCmd });
+      } else {
+        response = await axios.post(`${API}/sliver/session/exec`, { session_id: selectedSession.id, command: sessionCmd });
+      }
+      const output = response.data.output || response.data.stdout || "";
+      const error = response.data.error || response.data.stderr || "";
+      setSessionOutput(prev => [...prev, { cmd: sessionCmd, output, error }]);
+      if (output) addTerminalLine("info", output.substring(0, 200));
+      if (error) addTerminalLine("error", error.substring(0, 200));
+    } catch (error) { addTerminalLine("error", error.message); }
+    setSessionCmd("");
+  };
+
+  const connectWebSocket = useCallback((scanId) => {
+    const wsUrl = API.replace("https://", "wss://").replace("http://", "ws://") + `/ws/scan/${scanId}`;
+    try {
+      const ws = new WebSocket(wsUrl);
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "scan_update") {
+          setScanStatus(data);
+          if (data.current_tool) addTerminalLine("info", `[WS] ${data.current_tool}: ${data.progress}%`);
+          if (data.status === "completed") {
+            if (data.suggested_chains?.length > 0) setSuggestedChains(data.suggested_chains);
+            if (data.recommended_modules?.length > 0) setRecommendedModules(data.recommended_modules);
+          }
+        }
+      };
+      ws.onerror = () => { logger("WS error, falling back to polling"); };
+      ws.onclose = () => { wsRef.current = null; };
+      wsRef.current = ws;
+    } catch (e) { /* WebSocket not available, polling will handle it */ }
+  }, [addTerminalLine]);
+
   useEffect(() => { loadMitreTactics(); loadHistory(); loadMsfModules(); loadAttackChains(); }, [loadMitreTactics, loadHistory, loadMsfModules, loadAttackChains]);
 
   const togglePhase = (phaseId) => {
@@ -138,6 +218,9 @@ function App() {
       const response = await axios.post(`${API}/scan/start`, { target, scan_phases: selectedPhases, tools: [] });
       setCurrentScanId(response.data.scan_id);
       addTerminalLine("success", `Operation ID: ${response.data.scan_id}`);
+      
+      // Try WebSocket first, fallback to polling
+      connectWebSocket(response.data.scan_id);
       pollIntervalRef.current = setInterval(() => pollScanStatus(response.data.scan_id), 2000);
     } catch (error) {
       addTerminalLine("error", `ERROR: ${error.response?.data?.detail || error.message}`);
@@ -447,6 +530,7 @@ function App() {
               <TabsTrigger value="ai" className="rounded-none border-b-2 border-transparent data-[state=active]:border-[#00F0FF] data-[state=active]:bg-transparent data-[state=active]:text-[#00F0FF] text-[#008F11] uppercase tracking-widest text-xs px-2 py-3" data-testid="ai-tab"><Cpu size={12} className="mr-1" />AI</TabsTrigger>
               <TabsTrigger value="history" className="rounded-none border-b-2 border-transparent data-[state=active]:border-[#00FF41] data-[state=active]:bg-transparent data-[state=active]:text-[#00FF41] text-[#008F11] uppercase tracking-widest text-xs px-2 py-3" data-testid="history-tab"><History size={12} className="mr-1" />OPS</TabsTrigger>
               <TabsTrigger value="chains" className="rounded-none border-b-2 border-transparent data-[state=active]:border-[#FF003C] data-[state=active]:bg-transparent data-[state=active]:text-[#FF003C] text-[#008F11] uppercase tracking-widest text-xs px-2 py-3" data-testid="chains-tab"><Link size={12} className="mr-1" />CHAINS</TabsTrigger>
+              <TabsTrigger value="c2" onClick={() => { if (!c2Dashboard) loadC2Dashboard(); }} className="rounded-none border-b-2 border-transparent data-[state=active]:border-[#00F0FF] data-[state=active]:bg-transparent data-[state=active]:text-[#00F0FF] text-[#008F11] uppercase tracking-widest text-xs px-2 py-3" data-testid="c2-tab"><Radio size={12} className="mr-1" />C2</TabsTrigger>
             </TabsList>
 
             <TabsContent value="killchain" className="flex-1 overflow-auto p-3 mt-0">
@@ -933,6 +1017,191 @@ function App() {
                 </div>
               )}
             </TabsContent>
+
+            {/* C2 Dashboard Tab */}
+            <TabsContent value="c2" className="flex-1 overflow-auto mt-0 p-3">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-[#00F0FF] text-xs uppercase tracking-widest flex items-center gap-2"><Radio size={14} /> C2 COMMAND & CONTROL</h3>
+                  <button onClick={loadC2Dashboard} className="text-[10px] text-[#008F11] hover:text-[#00FF41]" data-testid="c2-refresh-btn"><RefreshCw size={12} className={c2Loading ? "animate-spin" : ""} /></button>
+                </div>
+
+                {!c2Dashboard ? (
+                  <div className="p-4 border border-[#00F0FF]/30 text-center">
+                    <Radio size={24} className="text-[#00F0FF] mx-auto mb-2" />
+                    <p className="text-xs text-[#008F11]">Loading C2 status...</p>
+                  </div>
+                ) : selectedSession ? (
+                  /* Session Interactive Shell */
+                  <div className="space-y-2" data-testid="session-shell">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-[#00FF41] flex items-center gap-1"><Command size={12} /> SESSION: {selectedSession.id}</span>
+                      <button onClick={() => { setSelectedSession(null); setSessionOutput([]); }} className="text-[#008F11] hover:text-[#FF003C]"><XCircle size={14} /></button>
+                    </div>
+                    <div className="p-1 border border-[#008F11]/30 text-[10px] text-[#008F11]">
+                      <span>{selectedSession.source === "msf" ? "Metasploit" : "Sliver"} | {selectedSession.target_host || selectedSession.remote_address || "?"} | {selectedSession.type}</span>
+                    </div>
+                    <ScrollArea className="h-[160px] bg-black/80 border border-[#008F11]/20 p-2">
+                      {sessionOutput.map((entry, idx) => (
+                        <div key={idx} className="mb-1">
+                          <div className="text-[10px] text-[#FFB000] font-mono">&gt; {entry.cmd}</div>
+                          {entry.output && <pre className="text-[10px] text-[#00FF41] font-mono whitespace-pre-wrap">{entry.output}</pre>}
+                          {entry.error && <pre className="text-[10px] text-[#FF003C] font-mono whitespace-pre-wrap">{entry.error}</pre>}
+                        </div>
+                      ))}
+                    </ScrollArea>
+                    <div className="flex gap-1">
+                      <input type="text" value={sessionCmd} onChange={(e) => setSessionCmd(e.target.value)} onKeyDown={(e) => e.key === "Enter" && runSessionCommand()} placeholder="Command..." className="matrix-input flex-1 text-xs" data-testid="session-cmd-input" />
+                      <button onClick={runSessionCommand} className="matrix-btn text-xs" style={{ borderColor: "#00FF41", color: "#00FF41" }} data-testid="session-cmd-run"><Play size={12} /></button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* MSF Status */}
+                    <div className="p-2 border border-[#FF003C]/30" data-testid="msf-status-panel">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs text-[#FF003C] font-bold flex items-center gap-1"><Skull size={12} /> METASPLOIT RPC</span>
+                        <span className={`text-[10px] px-2 py-0.5 border ${c2Dashboard.metasploit?.connected ? "border-[#00FF41] text-[#00FF41]" : "border-[#FF003C] text-[#FF003C]"}`}>
+                          {c2Dashboard.metasploit?.connected ? "CONNECTED" : "OFFLINE"}
+                        </span>
+                      </div>
+                      {c2Dashboard.metasploit?.connected ? (
+                        <div className="space-y-1">
+                          <p className="text-[10px] text-[#008F11]">v{c2Dashboard.metasploit.version} | Sessions: {c2Dashboard.metasploit.session_count} | Jobs: {c2Dashboard.metasploit.job_count}</p>
+                          
+                          {/* MSF RPC Search */}
+                          <div className="flex gap-1 mt-2">
+                            <input type="text" value={msfSearchQuery} onChange={(e) => setMsfSearchQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && searchMsfRpc(msfSearchQuery)} placeholder="Search MSF modules..." className="matrix-input flex-1 text-xs" data-testid="msf-rpc-search" />
+                            <button onClick={() => searchMsfRpc(msfSearchQuery)} className="matrix-btn text-xs" style={{ borderColor: "#FF003C" }}><Radar size={12} /></button>
+                          </div>
+                          {msfRpcModules.length > 0 && (
+                            <ScrollArea className="h-[80px]">
+                              {msfRpcModules.map((mod, idx) => (
+                                <div key={idx} className="p-1 border-b border-[#FF003C]/10 text-[10px] hover:bg-[#FF003C]/5 cursor-pointer" onClick={() => { setMsfModule(mod.name); setActiveTab("msf"); }}>
+                                  <span className="text-[#FF003C]">{mod.name}</span>
+                                  <span className="text-[#008F11] ml-2">{mod.desc}</span>
+                                </div>
+                              ))}
+                            </ScrollArea>
+                          )}
+                          
+                          {/* MSF Sessions */}
+                          {c2Dashboard.metasploit.sessions?.length > 0 && (
+                            <div className="mt-2">
+                              <span className="text-[10px] text-[#FFB000] uppercase">Active Sessions:</span>
+                              {c2Dashboard.metasploit.sessions.map((s, idx) => (
+                                <div key={idx} onClick={() => setSelectedSession({...s, source: "msf"})} className="p-1 border border-[#00FF41]/30 hover:border-[#00FF41] cursor-pointer mt-1 flex items-center justify-between" data-testid={`msf-session-${s.id}`}>
+                                  <span className="text-[10px] text-[#00FF41]">{s.type} @ {s.target_host}</span>
+                                  <span className="text-[10px] text-[#008F11]">{s.via_exploit}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-[#008F11] space-y-1">
+                          <p>{c2Dashboard.metasploit?.error}</p>
+                          <p className="text-[#FFB000]">En tu Kali ejecuta:</p>
+                          <div className="bg-black/50 p-1 font-mono text-[#00FF41]">msfrpcd -P {'{'}TOKEN{'}'} -S -a 127.0.0.1</div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Sliver Status */}
+                    <div className="p-2 border border-[#00F0FF]/30" data-testid="sliver-status-panel">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs text-[#00F0FF] font-bold flex items-center gap-1"><Wifi size={12} /> SLIVER C2</span>
+                        <span className={`text-[10px] px-2 py-0.5 border ${c2Dashboard.sliver?.connected ? "border-[#00FF41] text-[#00FF41]" : "border-[#FF003C] text-[#FF003C]"}`}>
+                          {c2Dashboard.sliver?.connected ? "CONNECTED" : "OFFLINE"}
+                        </span>
+                      </div>
+                      {c2Dashboard.sliver?.connected ? (
+                        <div className="space-y-1">
+                          <p className="text-[10px] text-[#008F11]">v{c2Dashboard.sliver.version} | Sessions: {c2Dashboard.sliver.session_count} | Beacons: {c2Dashboard.sliver.beacon_count}</p>
+                          
+                          {/* Sliver Sessions */}
+                          {c2Dashboard.sliver.sessions?.map((s, idx) => (
+                            <div key={idx} onClick={() => setSelectedSession({...s, source: "sliver"})} className="p-1 border border-[#00F0FF]/30 hover:border-[#00F0FF] cursor-pointer flex items-center justify-between" data-testid={`sliver-session-${s.id}`}>
+                              <span className="text-[10px] text-[#00F0FF]">{s.name} @ {s.hostname}</span>
+                              <span className="text-[10px] text-[#008F11]">{s.os}/{s.arch}</span>
+                            </div>
+                          ))}
+                          
+                          {/* Sliver Beacons */}
+                          {c2Dashboard.sliver.beacons?.map((b, idx) => (
+                            <div key={idx} className="p-1 border border-[#FFB000]/30 flex items-center justify-between">
+                              <span className="text-[10px] text-[#FFB000]">{b.name} @ {b.hostname}</span>
+                              <span className="text-[10px] text-[#008F11]">{b.os} | interval: {b.interval}s</span>
+                            </div>
+                          ))}
+                          
+                          {/* Generate Implant */}
+                          <div className="mt-2 p-2 border border-[#00F0FF]/20">
+                            <span className="text-[10px] text-[#00F0FF] uppercase">Generate Implant</span>
+                            <div className="grid grid-cols-3 gap-1 mt-1">
+                              <input type="text" value={sliverGenConfig.name} onChange={(e) => setSliverGenConfig({...sliverGenConfig, name: e.target.value})} placeholder="Name" className="matrix-input text-[10px]" data-testid="sliver-name" />
+                              <input type="text" value={sliverGenConfig.lhost} onChange={(e) => setSliverGenConfig({...sliverGenConfig, lhost: e.target.value})} placeholder="LHOST" className="matrix-input text-[10px]" data-testid="sliver-lhost" />
+                              <input type="number" value={sliverGenConfig.lport} onChange={(e) => setSliverGenConfig({...sliverGenConfig, lport: parseInt(e.target.value)})} className="matrix-input text-[10px]" data-testid="sliver-lport" />
+                            </div>
+                            <div className="grid grid-cols-3 gap-1 mt-1">
+                              <select value={sliverGenConfig.os} onChange={(e) => setSliverGenConfig({...sliverGenConfig, os: e.target.value})} className="matrix-input text-[10px]">
+                                <option value="linux">Linux</option><option value="windows">Windows</option><option value="darwin">macOS</option>
+                              </select>
+                              <select value={sliverGenConfig.arch} onChange={(e) => setSliverGenConfig({...sliverGenConfig, arch: e.target.value})} className="matrix-input text-[10px]">
+                                <option value="amd64">x64</option><option value="386">x86</option><option value="arm64">ARM64</option>
+                              </select>
+                              <select value={sliverGenConfig.type} onChange={(e) => setSliverGenConfig({...sliverGenConfig, type: e.target.value})} className="matrix-input text-[10px]">
+                                <option value="session">Session</option><option value="beacon">Beacon</option>
+                              </select>
+                            </div>
+                            <button onClick={async () => {
+                              addTerminalLine("command", `> Generating ${sliverGenConfig.type}: ${sliverGenConfig.name}`);
+                              try {
+                                const resp = await axios.post(`${API}/sliver/implant/generate`, sliverGenConfig);
+                                if (resp.data.error) { addTerminalLine("error", resp.data.error); }
+                                else { addTerminalLine("success", `Implant generated: ${resp.data.file_name} (${resp.data.size} bytes)`); }
+                              } catch (e) { addTerminalLine("error", e.message); }
+                            }} className="matrix-btn w-full justify-center text-[10px] mt-1" style={{ borderColor: "#00F0FF", color: "#00F0FF" }} data-testid="sliver-generate-btn">
+                              <Upload size={10} /> GENERATE
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-[#008F11] space-y-1">
+                          <p>{c2Dashboard.sliver?.error}</p>
+                          <p className="text-[#FFB000]">Para instalar Sliver en tu Kali:</p>
+                          <div className="bg-black/50 p-1 font-mono text-[#00FF41] space-y-0.5">
+                            <div>curl https://sliver.sh/install|sudo bash</div>
+                            <div>sliver-server</div>
+                            <div>new-operator --name redteam --lhost 127.0.0.1</div>
+                          </div>
+                          <p className="text-[#FFB000] mt-1">Luego configura SLIVER_CONFIG_PATH en backend/.env</p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Listener Quick Start */}
+                    <div className="p-2 border border-[#008F11]/30">
+                      <span className="text-[10px] text-[#008F11] uppercase">Quick Start Listeners</span>
+                      <div className="grid grid-cols-2 gap-1 mt-1">
+                        <button onClick={async () => {
+                          try {
+                            const resp = await axios.post(`${API}/sliver/listener/start`, { lhost: "0.0.0.0", lport: 443, protocol: "mtls" });
+                            addTerminalLine(resp.data.success ? "success" : "error", resp.data.success ? `mTLS listener on :443` : resp.data.error);
+                          } catch (e) { addTerminalLine("error", e.message); }
+                        }} className="matrix-btn text-[10px] justify-center" style={{ borderColor: "#00F0FF", color: "#00F0FF" }} data-testid="listener-mtls"><Lock size={10} /> mTLS:443</button>
+                        <button onClick={async () => {
+                          try {
+                            const resp = await axios.post(`${API}/sliver/listener/start`, { lhost: "0.0.0.0", lport: 8443, protocol: "https" });
+                            addTerminalLine(resp.data.success ? "success" : "error", resp.data.success ? `HTTPS listener on :8443` : resp.data.error);
+                          } catch (e) { addTerminalLine("error", e.message); }
+                        }} className="matrix-btn text-[10px] justify-center" style={{ borderColor: "#FFB000", color: "#FFB000" }} data-testid="listener-https"><Globe size={10} /> HTTPS:8443</button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </TabsContent>
           </Tabs>
         </section>
       </main>
@@ -943,6 +1212,8 @@ function App() {
           <span className="text-[#FF003C]">TARGET: {target || 'N/A'}</span>
           <span>PHASES: {selectedPhases.length}/14</span>
           {attackTree && <span className="text-[#FFB000]">NODES: {treeStats.total}</span>}
+          {c2Dashboard?.metasploit?.connected && <span className="text-[#FF003C]">MSF:ON</span>}
+          {c2Dashboard?.sliver?.connected && <span className="text-[#00F0FF]">SLIVER:ON</span>}
           <span className="text-[#FF003C]">MITRE ATT&CK</span>
         </div>
       </footer>

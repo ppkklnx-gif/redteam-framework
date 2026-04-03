@@ -15,6 +15,7 @@ import httpx
 import json
 import re
 import io
+import asyncio
 from fpdf import FPDF
 
 ROOT_DIR = Path(__file__).parent
@@ -26,6 +27,10 @@ db = client[os.environ['DB_NAME']]
 
 KIMI_API_KEY = os.environ.get('KIMI_API_KEY', '')
 KIMI_API_URL = "https://api.moonshot.ai/v1/chat/completions"
+MSF_RPC_TOKEN = os.environ.get('MSF_RPC_TOKEN', '')
+MSF_RPC_HOST = os.environ.get('MSF_RPC_HOST', '127.0.0.1')
+MSF_RPC_PORT = int(os.environ.get('MSF_RPC_PORT', '55553'))
+SLIVER_CONFIG_PATH = os.environ.get('SLIVER_CONFIG_PATH', '')
 
 app = FastAPI(title="Red Team Automation Framework")
 api_router = APIRouter(prefix="/api")
@@ -1704,6 +1709,238 @@ async def execute_chain_step(execution_id: str, step_id: int):
         chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
     
     return step_results
+
+# ============ WEBSOCKET REAL-TIME UPDATES ============
+
+@api_router.websocket("/ws/scan/{scan_id}")
+async def websocket_scan(websocket: WebSocket, scan_id: str):
+    """WebSocket for real-time scan progress"""
+    await websocket.accept()
+    if scan_id not in active_connections:
+        active_connections[scan_id] = []
+    active_connections[scan_id].append(websocket)
+    
+    try:
+        while True:
+            # Keep connection alive, send updates
+            if scan_id in scan_progress:
+                p = scan_progress[scan_id]
+                await websocket.send_json({
+                    "type": "scan_update",
+                    "scan_id": scan_id,
+                    "status": p["status"],
+                    "progress": p["progress"],
+                    "current_tool": p["current_tool"],
+                    "results": p["results"],
+                    "tactical_decisions": p.get("tactical_decisions", []),
+                    "suggested_chains": p.get("suggested_chains", []),
+                    "recommended_modules": p.get("recommended_modules", [])
+                })
+                if p["status"] in ["completed", "error"]:
+                    break
+            
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+    finally:
+        if scan_id in active_connections and websocket in active_connections[scan_id]:
+            active_connections[scan_id].remove(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@api_router.websocket("/ws/chain/{execution_id}")
+async def websocket_chain(websocket: WebSocket, execution_id: str):
+    """WebSocket for real-time chain execution progress"""
+    await websocket.accept()
+    try:
+        while True:
+            if execution_id in active_chains:
+                chain = active_chains[execution_id]
+                await websocket.send_json({
+                    "type": "chain_update",
+                    "id": chain["id"],
+                    "chain_id": chain["chain_id"],
+                    "chain_name": chain["chain_name"],
+                    "status": chain["status"],
+                    "current_step": chain["current_step"],
+                    "total_steps": chain["total_steps"],
+                    "progress": chain.get("progress", 0),
+                    "step_statuses": chain.get("step_statuses", {}),
+                    "results": chain.get("results", [])
+                })
+                if chain["status"] in ["completed", "error"]:
+                    break
+            else:
+                await websocket.send_json({"type": "chain_not_found", "id": execution_id})
+                break
+            
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ============ METASPLOIT RPC ENDPOINTS ============
+
+import modules as msf_module
+import modules.sliver_c2 as sliver_module
+
+@api_router.get("/msf/status")
+async def msf_rpc_status():
+    """Check msfrpcd connection status"""
+    return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+
+@api_router.post("/msf/connect")
+async def msf_rpc_connect():
+    """Connect to msfrpcd"""
+    msf_module.disconnect_msf()
+    return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+
+@api_router.get("/msf/search")
+async def msf_rpc_search(query: str = "", module_type: str = ""):
+    """Search modules via msfrpcd"""
+    if not msf_module.is_connected():
+        return {"modules": [], "source": "static", "hint": "msfrpcd not connected, showing static modules"}
+    modules = msf_module.search_modules(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, query, module_type)
+    return {"modules": modules, "source": "msfrpcd", "count": len(modules)}
+
+@api_router.get("/msf/module/info")
+async def msf_rpc_module_info(module_type: str, module_name: str):
+    """Get module details via msfrpcd"""
+    return msf_module.get_module_info(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, module_type, module_name)
+
+@api_router.post("/msf/module/execute")
+async def msf_rpc_execute(data: Dict[str, Any]):
+    """Execute module via msfrpcd"""
+    return msf_module.execute_module(
+        MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT,
+        data.get("module_type", "exploit"),
+        data.get("module_name", ""),
+        data.get("options", {})
+    )
+
+@api_router.get("/msf/sessions")
+async def msf_rpc_sessions():
+    """List active Metasploit sessions"""
+    sessions = msf_module.list_sessions(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    return {"sessions": sessions, "count": len(sessions)}
+
+@api_router.post("/msf/session/command")
+async def msf_rpc_session_command(data: Dict[str, Any]):
+    """Run command on MSF session"""
+    return msf_module.session_command(
+        MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT,
+        data.get("session_id", ""),
+        data.get("command", "")
+    )
+
+@api_router.get("/msf/jobs")
+async def msf_rpc_jobs():
+    """List active MSF jobs"""
+    jobs = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    return {"jobs": jobs, "count": len(jobs)}
+
+@api_router.post("/msf/job/kill")
+async def msf_rpc_kill_job(data: Dict[str, Any]):
+    """Kill a MSF job"""
+    return msf_module.kill_job(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, data.get("job_id", ""))
+
+
+# ============ SLIVER C2 ENDPOINTS ============
+
+@api_router.get("/sliver/status")
+async def sliver_status():
+    """Check Sliver C2 connection status"""
+    return await sliver_module.get_status(SLIVER_CONFIG_PATH)
+
+@api_router.get("/sliver/sessions")
+async def sliver_sessions():
+    """List Sliver sessions"""
+    sessions = await sliver_module.list_sessions(SLIVER_CONFIG_PATH)
+    return {"sessions": sessions, "count": len(sessions)}
+
+@api_router.get("/sliver/beacons")
+async def sliver_beacons():
+    """List Sliver beacons"""
+    beacons = await sliver_module.list_beacons(SLIVER_CONFIG_PATH)
+    return {"beacons": beacons, "count": len(beacons)}
+
+@api_router.get("/sliver/implants")
+async def sliver_implants():
+    """List Sliver implants"""
+    implants = await sliver_module.list_implants(SLIVER_CONFIG_PATH)
+    return {"implants": implants, "count": len(implants)}
+
+@api_router.post("/sliver/implant/generate")
+async def sliver_generate_implant(data: Dict[str, Any]):
+    """Generate a Sliver implant"""
+    return await sliver_module.generate_implant(
+        SLIVER_CONFIG_PATH,
+        name=data.get("name", "implant"),
+        lhost=data.get("lhost", "127.0.0.1"),
+        lport=data.get("lport", 443),
+        os_target=data.get("os", "linux"),
+        arch=data.get("arch", "amd64"),
+        implant_type=data.get("type", "session"),
+        format_type=data.get("format", "executable")
+    )
+
+@api_router.post("/sliver/session/exec")
+async def sliver_session_exec(data: Dict[str, Any]):
+    """Execute command on Sliver session"""
+    return await sliver_module.session_exec(
+        SLIVER_CONFIG_PATH,
+        data.get("session_id", ""),
+        data.get("command", "")
+    )
+
+@api_router.post("/sliver/listener/start")
+async def sliver_start_listener(data: Dict[str, Any]):
+    """Start a Sliver listener"""
+    return await sliver_module.start_listener(
+        SLIVER_CONFIG_PATH,
+        lhost=data.get("lhost", "0.0.0.0"),
+        lport=data.get("lport", 443),
+        protocol=data.get("protocol", "mtls")
+    )
+
+# ============ C2 UNIFIED DASHBOARD ============
+
+@api_router.get("/c2/dashboard")
+async def c2_dashboard():
+    """Unified C2 dashboard - MSF + Sliver status"""
+    msf_status = msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    sliver_stat = await sliver_module.get_status(SLIVER_CONFIG_PATH)
+    
+    msf_sessions = msf_module.list_sessions(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
+    msf_jobs = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
+    
+    sliver_sess = await sliver_module.list_sessions(SLIVER_CONFIG_PATH) if sliver_stat.get("connected") else []
+    sliver_bcn = await sliver_module.list_beacons(SLIVER_CONFIG_PATH) if sliver_stat.get("connected") else []
+    
+    return {
+        "metasploit": {
+            **msf_status,
+            "sessions": msf_sessions,
+            "session_count": len(msf_sessions),
+            "jobs": msf_jobs,
+            "job_count": len(msf_jobs)
+        },
+        "sliver": {
+            **sliver_stat,
+            "sessions": sliver_sess,
+            "session_count": len(sliver_sess),
+            "beacons": sliver_bcn,
+            "beacon_count": len(sliver_bcn)
+        }
+    }
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','), allow_methods=["*"], allow_headers=["*"])
