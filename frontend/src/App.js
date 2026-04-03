@@ -75,6 +75,8 @@ function App() {
   const [chainContext, setChainContext] = useState({ lhost: "", domain: "", user: "", pass: "" });
   const [chainAutoExec, setChainAutoExec] = useState(false);
   const [chainPolling, setChainPolling] = useState(false);
+  const [suggestedChains, setSuggestedChains] = useState([]);
+  const [recommendedModules, setRecommendedModules] = useState([]);
   const chainPollRef = useRef(null);
   const terminalRef = useRef(null);
   const pollIntervalRef = useRef(null);
@@ -173,6 +175,22 @@ function App() {
         addTerminalLine("success", "═══════════════════════════════════════════════════════");
         addTerminalLine("success", "OPERATION COMPLETE - ATTACK TREE GENERATED");
         addTerminalLine("success", "═══════════════════════════════════════════════════════");
+        
+        // Show suggested chains
+        if (response.data.suggested_chains?.length > 0) {
+          setSuggestedChains(response.data.suggested_chains);
+          addTerminalLine("warning", `[CHAINS] ${response.data.suggested_chains.length} cadena(s) de ataque sugerida(s):`);
+          response.data.suggested_chains.forEach(c => {
+            addTerminalLine("info", `  >> ${c.name} (trigger: ${c.trigger_matched})`);
+          });
+        }
+        
+        // Store recommended modules
+        if (response.data.recommended_modules?.length > 0) {
+          setRecommendedModules(response.data.recommended_modules);
+          addTerminalLine("warning", `[MSF] ${response.data.recommended_modules.length} modulo(s) recomendado(s) segun hallazgos`);
+        }
+        
         loadHistory();
         setActiveTab("tree");
       }
@@ -541,7 +559,7 @@ function App() {
                       <div><label className="text-[10px] text-[#008F11] uppercase">RPORT</label><input type="text" value={msfPort} onChange={(e) => setMsfPort(e.target.value)} placeholder="80" className="matrix-input w-full mt-1 text-xs" /></div>
                     </div>
                     <div><label className="text-[10px] text-[#008F11] uppercase">LHOST (for reverse shells)</label><input type="text" value={msfLhost} onChange={(e) => setMsfLhost(e.target.value)} placeholder="Your IP" className="matrix-input w-full mt-1 text-xs" /></div>
-                    <button onClick={executeMsfExploit} disabled={msfExecuting} className="matrix-btn w-full justify-center text-xs" style={{ borderColor: "#FF003C", color: "#FF003C" }}>
+                    <button onClick={executeMsfExploit} disabled={msfExecuting} className="matrix-btn w-full justify-center text-xs" style={{ borderColor: "#FF003C", color: "#FF003C" }} data-testid="execute-exploit-btn">
                       {msfExecuting ? <><RefreshCw size={12} className="animate-spin" /> EXPLOITING...</> : <><Skull size={12} /> EXECUTE EXPLOIT</>}
                     </button>
                     {msfResult && (
@@ -559,16 +577,44 @@ function App() {
                 </div>
               ) : (
                 <div className="space-y-3">
+                  {/* Recommended modules based on scan */}
+                  {recommendedModules.length > 0 && (
+                    <div data-testid="recommended-modules-section">
+                      <p className="text-xs text-[#FF003C] uppercase tracking-wider mb-2 flex items-center gap-1"><Zap size={12} /> RECOMENDADOS (segun escaneo)</p>
+                      <div className="space-y-1 mb-3">
+                        {recommendedModules.map((mod, idx) => (
+                          <div key={`rec-${idx}`} onClick={() => setMsfModule(mod.name)} className="p-2 border border-[#FF003C]/50 hover:border-[#FF003C] cursor-pointer bg-[#FF003C]/5" data-testid={`recommended-module-${idx}`}>
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] text-[#FF003C] font-mono truncate flex-1">{mod.name}</span>
+                              <div className="flex items-center gap-1">
+                                <span className="text-[10px] px-1 border border-[#FFB000]/50 text-[#FFB000]">Score: {mod.relevance_score}</span>
+                                <span className={`text-[10px] ${mod.rank === 'excellent' ? 'text-[#00FF41]' : 'text-[#008F11]'}`}>{mod.rank}</span>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-[#008F11]">{mod.desc}</p>
+                            <div className="flex gap-1 mt-1 flex-wrap">
+                              {mod.reasons?.map((r, ri) => (
+                                <span key={ri} className="text-[10px] px-1 border border-[#00FF41]/30 text-[#00FF41]">{r}</span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* All modules browser */}
+                  <p className="text-xs text-[#008F11] uppercase tracking-wider mb-1">{recommendedModules.length > 0 ? "TODOS LOS MODULOS" : "MODULOS METASPLOIT"}</p>
                   <div className="flex gap-2">
-                    <input type="text" value={moduleSearch} onChange={(e) => { setModuleSearch(e.target.value); loadMsfModules(e.target.value, msfCategory); }} placeholder="Search modules..." className="matrix-input flex-1 text-xs" />
-                    <select value={msfCategory} onChange={(e) => { setMsfCategory(e.target.value); loadMsfModules(moduleSearch, e.target.value); }} className="matrix-input text-xs w-24">
+                    <input type="text" value={moduleSearch} onChange={(e) => { setModuleSearch(e.target.value); loadMsfModules(e.target.value, msfCategory); }} placeholder="Search modules..." className="matrix-input flex-1 text-xs" data-testid="msf-search-input" />
+                    <select value={msfCategory} onChange={(e) => { setMsfCategory(e.target.value); loadMsfModules(moduleSearch, e.target.value); }} className="matrix-input text-xs w-24" data-testid="msf-category-select">
                       <option value="">All</option>
                       <option value="exploit">Exploit</option>
                       <option value="auxiliary">Auxiliary</option>
                       <option value="post">Post</option>
                     </select>
                   </div>
-                  <ScrollArea className="h-[280px]">
+                  <ScrollArea className="h-[200px]">
                     <div className="space-y-1">
                       {msfModules.map((mod, idx) => (
                         <div key={idx} onClick={() => setMsfModule(mod.name)} className="p-2 border border-[#FF003C]/20 hover:border-[#FF003C] cursor-pointer">
@@ -612,7 +658,36 @@ function App() {
                           ))}
                         </div>
                       )}
-                      {currentScanId && <button onClick={() => downloadReport(currentScanId)} className="matrix-btn w-full justify-center mt-3 text-xs"><Download size={12} /> DOWNLOAD REPORT</button>}
+                      {currentScanId && (
+                        <div className="flex gap-2 mt-3">
+                          <button onClick={() => downloadReport(currentScanId)} className="matrix-btn flex-1 justify-center text-xs" data-testid="download-json-btn"><Download size={12} /> JSON</button>
+                          <button onClick={() => { window.open(`${API}/scan/${currentScanId}/report/pdf`, '_blank'); addTerminalLine("success", "PDF report descargado"); }} className="matrix-btn flex-1 justify-center text-xs" style={{ borderColor: "#00F0FF", color: "#00F0FF" }} data-testid="download-pdf-btn"><Download size={12} /> PDF REPORT</button>
+                        </div>
+                      )}
+                      
+                      {/* Suggested Chains Section */}
+                      {suggestedChains.length > 0 && (
+                        <div className="mt-4 p-2 border border-[#FFB000]/40" data-testid="suggested-chains-section">
+                          <h4 className="text-[10px] uppercase tracking-widest text-[#FFB000] mb-2 flex items-center gap-1"><Link size={12} /> CADENAS DE ATAQUE SUGERIDAS</h4>
+                          {suggestedChains.map((chain, idx) => (
+                            <div key={idx} onClick={async () => {
+                              try {
+                                const resp = await axios.get(`${API}/chains/${chain.id}`);
+                                setSelectedChain({ id: chain.id, ...resp.data });
+                                setChainExecution(null);
+                                setActiveTab("chains");
+                              } catch (e) { addTerminalLine("error", e.message); }
+                            }} className="p-2 border border-[#FFB000]/30 hover:border-[#FFB000] cursor-pointer mb-1" data-testid={`suggested-chain-${chain.id}`}>
+                              <div className="flex items-center justify-between">
+                                <span className="text-[10px] text-[#FFB000] font-bold">{chain.name}</span>
+                                <span className="text-[10px] text-[#008F11]">{chain.total_steps} steps</span>
+                              </div>
+                              <p className="text-[10px] text-[#008F11]">{chain.description}</p>
+                              <span className="text-[10px] text-[#00FF41]">Trigger: {chain.trigger_matched}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center"><Cpu size={32} className="text-[#00F0FF] opacity-30 mb-2" /><p className="text-[#008F11] text-xs uppercase">{isScanning ? "Analyzing..." : "Start operation for AI analysis"}</p></div>

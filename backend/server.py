@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -13,6 +14,8 @@ import subprocess
 import httpx
 import json
 import re
+import io
+from fpdf import FPDF
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -1031,6 +1034,14 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
         scan_progress[scan_id]["status"] = "completed"
         scan_progress[scan_id]["progress"] = 100
         
+        # Auto-detect applicable attack chains based on findings
+        suggested_chains = AttackChainEngine.get_applicable_chains(scan_progress[scan_id]["results"])
+        scan_progress[scan_id]["suggested_chains"] = suggested_chains
+        
+        # Get recommended MSF modules based on findings
+        recommended_modules = get_recommended_modules(scan_progress[scan_id]["results"], final_tactical)
+        scan_progress[scan_id]["recommended_modules"] = recommended_modules
+        
         await db.scans.insert_one({
             "id": scan_id, "target": target, "status": "completed",
             "phases": phases, "results": scan_progress[scan_id]["results"],
@@ -1038,6 +1049,8 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
             "final_tactical": final_tactical,
             "ai_analysis": scan_progress[scan_id]["ai_analysis"],
             "attack_tree": attack_tree,
+            "suggested_chains": suggested_chains,
+            "recommended_modules": recommended_modules,
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         
@@ -1045,6 +1058,55 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
         logger.error(f"Scan error: {str(e)}")
         scan_progress[scan_id]["status"] = "error"
         scan_progress[scan_id]["error"] = str(e)
+
+
+def get_recommended_modules(results: Dict, tactical: Dict) -> List[Dict]:
+    """Get MSF modules recommended based on scan findings"""
+    recommended = []
+    results_text = json.dumps(results).lower()
+    tactical_text = json.dumps(tactical).lower()
+    combined = results_text + " " + tactical_text
+    
+    for mod in METASPLOIT_MODULES:
+        score = 0
+        reasons = []
+        mod_name_lower = mod["name"].lower()
+        mod_desc_lower = mod["desc"].lower()
+        
+        # Check service matches
+        if "smb" in combined and "smb" in mod_name_lower:
+            score += 3
+            reasons.append("SMB service detected")
+        if "ssh" in combined and "ssh" in mod_name_lower:
+            score += 3
+            reasons.append("SSH service detected")
+        if ("http" in combined or "80/tcp" in combined) and "http" in mod_name_lower:
+            score += 2
+            reasons.append("HTTP service detected")
+        if "rdp" in combined and "rdp" in mod_name_lower:
+            score += 3
+            reasons.append("RDP service detected")
+        
+        # Check vulnerability matches
+        if "shellshock" in combined and "shellshock" in mod_desc_lower:
+            score += 5
+            reasons.append("Shellshock vulnerability found")
+        if "eternalblue" in combined and "eternalblue" in mod_desc_lower:
+            score += 5
+            reasons.append("EternalBlue vulnerability found")
+        if "log4" in combined and "log4" in mod_desc_lower:
+            score += 5
+            reasons.append("Log4Shell vulnerability found")
+        
+        # Excellent rank bonus
+        if mod["rank"] == "excellent":
+            score += 1
+        
+        if score > 0:
+            recommended.append({**mod, "relevance_score": score, "reasons": reasons})
+    
+    recommended.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return recommended
 
 # =============================================================================
 # API ROUTES
@@ -1098,7 +1160,9 @@ async def get_scan_status(scan_id: str):
             "tactical_decisions": p.get("tactical_decisions", []),
             "final_tactical": p.get("final_tactical"),
             "ai_analysis": p.get("ai_analysis"), "exploits": p.get("exploits", []),
-            "attack_tree": p.get("attack_tree")
+            "attack_tree": p.get("attack_tree"),
+            "suggested_chains": p.get("suggested_chains", []),
+            "recommended_modules": p.get("recommended_modules", [])
         }
     
     scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
@@ -1109,7 +1173,9 @@ async def get_scan_status(scan_id: str):
             "tactical_decisions": scan.get("tactical_decisions", []),
             "final_tactical": scan.get("final_tactical"),
             "ai_analysis": scan.get("ai_analysis"), "exploits": scan.get("exploits", []),
-            "attack_tree": scan.get("attack_tree")
+            "attack_tree": scan.get("attack_tree"),
+            "suggested_chains": scan.get("suggested_chains", []),
+            "recommended_modules": scan.get("recommended_modules", [])
         }
     raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -1160,6 +1226,227 @@ async def get_scan_report(scan_id: str):
     if not scan:
         raise HTTPException(status_code=404, detail="Not found")
     return {"report": scan}
+
+def sanitize_for_pdf(text: str) -> str:
+    """Sanitize text for PDF - replace Unicode chars not supported by Courier font"""
+    if not text:
+        return ""
+    # Replace common Unicode characters with ASCII equivalents
+    replacements = {
+        '→': '->',
+        '←': '<-',
+        '↔': '<->',
+        '•': '*',
+        '–': '-',
+        '—': '-',
+        '"': '"',
+        '"': '"',
+        ''': "'",
+        ''': "'",
+        '…': '...',
+        '✓': '[OK]',
+        '✗': '[X]',
+        '★': '*',
+        '☆': '*',
+        '█': '#',
+        '▓': '#',
+        '░': '.',
+        '═': '=',
+        '║': '|',
+        '╔': '+',
+        '╗': '+',
+        '╚': '+',
+        '╝': '+',
+        '╠': '+',
+        '╣': '+',
+        '╦': '+',
+        '╩': '+',
+        '╬': '+',
+    }
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+    # Remove any remaining non-latin1 characters
+    try:
+        return text.encode('latin-1', errors='replace').decode('latin-1')
+    except Exception:
+        return text.encode('ascii', errors='replace').decode('ascii')
+
+@api_router.get("/scan/{scan_id}/report/pdf")
+async def get_scan_report_pdf(scan_id: str):
+    """Generate informal PDF report - estilo reporte entre colegas"""
+    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    
+    # Header
+    pdf.set_font("Courier", "B", 18)
+    pdf.cell(0, 12, "RED TEAM - REPORTE DE OPERACION", ln=True, align="C")
+    pdf.set_font("Courier", "", 10)
+    pdf.cell(0, 8, f"Fecha: {scan.get('created_at', 'N/A')}", ln=True, align="C")
+    pdf.cell(0, 8, f"Target: {scan.get('target', 'N/A')}", ln=True, align="C")
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+    
+    # Resumen ejecutivo - informal
+    pdf.set_font("Courier", "B", 14)
+    pdf.cell(0, 10, "QUE ENCONTRAMOS", ln=True)
+    pdf.set_font("Courier", "", 10)
+    
+    # Status
+    status = scan.get("status", "unknown")
+    pdf.cell(0, 7, f"Estado del escaneo: {status.upper()}", ln=True)
+    phases = scan.get("phases", [])
+    pdf.cell(0, 7, f"Fases ejecutadas: {', '.join(phases)}", ln=True)
+    pdf.ln(3)
+    
+    # Tool results summary
+    results = scan.get("results", {})
+    if results:
+        pdf.set_font("Courier", "B", 12)
+        pdf.cell(0, 10, "RESULTADOS POR HERRAMIENTA", ln=True)
+        pdf.set_font("Courier", "", 9)
+        
+        for tool_name, tool_result in results.items():
+            pdf.set_font("Courier", "B", 10)
+            pdf.cell(0, 8, f">>> {tool_name.upper()}", ln=True)
+            pdf.set_font("Courier", "", 9)
+            
+            if tool_name == "wafw00f" or "waf" in tool_name:
+                waf = tool_result.get("waf", "No detectado")
+                pdf.cell(0, 6, f"  WAF detectado: {waf or 'Ninguno'}", ln=True)
+            elif tool_name == "nmap":
+                ports = tool_result.get("ports", [])
+                if ports:
+                    for p in ports[:15]:
+                        pdf.cell(0, 6, f"  {p.get('port','?')} - {p.get('state','?')} - {p.get('service','?')}", ln=True)
+                else:
+                    pdf.cell(0, 6, "  Sin puertos abiertos o resultado simulado", ln=True)
+            elif tool_name == "nikto":
+                vulns = tool_result.get("vulnerabilities", [])
+                if vulns:
+                    for v in vulns[:10]:
+                        finding = v.get("finding", str(v))[:90]
+                        pdf.cell(0, 6, f"  [{v.get('severity','?')}] {finding}", ln=True)
+                else:
+                    pdf.cell(0, 6, "  Sin vulnerabilidades detectadas", ln=True)
+            else:
+                if tool_result.get("simulated"):
+                    pdf.cell(0, 6, f"  [SIMULADO] Comando: {tool_result.get('command', 'N/A')[:80]}", ln=True)
+                elif tool_result.get("output"):
+                    output_lines = str(tool_result["output"])[:300].split('\n')
+                    for line in output_lines[:5]:
+                        pdf.cell(0, 6, f"  {line[:90]}", ln=True)
+            pdf.ln(2)
+    
+    # Tactical Analysis
+    final_tactical = scan.get("final_tactical", {})
+    if final_tactical:
+        pdf.add_page()
+        pdf.set_font("Courier", "B", 14)
+        pdf.cell(0, 10, "ANALISIS TACTICO", ln=True)
+        pdf.set_font("Courier", "", 9)
+        
+        strategy = sanitize_for_pdf(final_tactical.get("overall_strategy", ""))
+        if strategy:
+            pdf.set_font("Courier", "B", 10)
+            pdf.cell(0, 8, "Estrategia general:", ln=True)
+            pdf.set_font("Courier", "", 9)
+            # Word wrap long text
+            for i in range(0, len(strategy), 90):
+                pdf.cell(0, 6, f"  {strategy[i:i+90]}", ln=True)
+        
+        waf_analysis = final_tactical.get("waf_analysis", {})
+        if waf_analysis and waf_analysis.get("waf_detected"):
+            pdf.ln(3)
+            pdf.set_font("Courier", "B", 10)
+            pdf.cell(0, 8, sanitize_for_pdf(f"WAF DETECTADO: {waf_analysis.get('waf_name','?')}"), ln=True)
+            pdf.set_font("Courier", "", 9)
+            alt = sanitize_for_pdf(waf_analysis.get("alternative_approach", ""))
+            pdf.cell(0, 6, f"  Bypass: {alt[:90]}", ln=True)
+        
+        priority_actions = final_tactical.get("priority_actions", [])
+        if priority_actions:
+            pdf.ln(3)
+            pdf.set_font("Courier", "B", 10)
+            pdf.cell(0, 8, "ACCIONES PRIORITARIAS:", ln=True)
+            pdf.set_font("Courier", "", 9)
+            for action in priority_actions:
+                pdf.cell(0, 6, sanitize_for_pdf(f"  [P{action.get('priority',0)}] {action.get('action','')}"), ln=True)
+                details = sanitize_for_pdf(action.get('details', ''))
+                if details:
+                    pdf.cell(0, 6, f"       {details[:80]}", ln=True)
+    
+    # AI Analysis
+    ai_analysis = scan.get("ai_analysis", "")
+    if ai_analysis and ai_analysis != "API key not configured":
+        pdf.add_page()
+        pdf.set_font("Courier", "B", 14)
+        pdf.cell(0, 10, "ANALISIS DE IA (KIMI K2)", ln=True)
+        pdf.set_font("Courier", "", 9)
+        
+        # Sanitize and split AI text into lines
+        ai_analysis = sanitize_for_pdf(ai_analysis)
+        for i in range(0, len(ai_analysis), 90):
+            chunk = ai_analysis[i:i+90]
+            try:
+                pdf.cell(0, 6, chunk, ln=True)
+            except Exception:
+                pdf.cell(0, 6, chunk.encode('ascii', 'replace').decode(), ln=True)
+    
+    # Suggested chains
+    suggested = scan.get("suggested_chains", [])
+    if suggested:
+        pdf.ln(5)
+        pdf.set_font("Courier", "B", 14)
+        pdf.cell(0, 10, "CADENAS DE ATAQUE SUGERIDAS", ln=True)
+        pdf.set_font("Courier", "", 9)
+        pdf.cell(0, 7, "Basado en lo que encontramos, estas cadenas aplican:", ln=True)
+        pdf.ln(2)
+        for chain in suggested:
+            pdf.set_font("Courier", "B", 10)
+            pdf.cell(0, 7, sanitize_for_pdf(f"  >> {chain.get('name','')} ({chain.get('total_steps',0)} pasos)"), ln=True)
+            pdf.set_font("Courier", "", 9)
+            pdf.cell(0, 6, sanitize_for_pdf(f"     {chain.get('description','')}"), ln=True)
+            pdf.cell(0, 6, sanitize_for_pdf(f"     Trigger: {chain.get('trigger_matched','')}"), ln=True)
+            pdf.ln(2)
+    
+    # Recommended modules
+    rec_modules = scan.get("recommended_modules", [])
+    if rec_modules:
+        pdf.ln(3)
+        pdf.set_font("Courier", "B", 14)
+        pdf.cell(0, 10, "MODULOS MSF RECOMENDADOS", ln=True)
+        pdf.set_font("Courier", "", 9)
+        for mod in rec_modules[:10]:
+            pdf.set_font("Courier", "B", 9)
+            pdf.cell(0, 7, f"  {mod.get('name','')}", ln=True)
+            pdf.set_font("Courier", "", 9)
+            reasons = ', '.join(mod.get('reasons', []))
+            pdf.cell(0, 6, f"    {mod.get('desc','')} | Score: {mod.get('relevance_score',0)} | {reasons}", ln=True)
+    
+    # Footer
+    pdf.ln(10)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_font("Courier", "I", 9)
+    pdf.cell(0, 7, "Generado por Red Team Automation Framework v3.2", ln=True, align="C")
+    pdf.cell(0, 7, "Este reporte es para uso interno del equipo. No distribuir.", ln=True, align="C")
+    
+    # Generate PDF bytes
+    pdf_bytes = pdf.output()
+    buffer = io.BytesIO(pdf_bytes)
+    buffer.seek(0)
+    
+    filename = f"redteam-report-{scan.get('target','unknown')}-{scan_id[:8]}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @api_router.delete("/scan/{scan_id}")
 async def delete_scan(scan_id: str):
