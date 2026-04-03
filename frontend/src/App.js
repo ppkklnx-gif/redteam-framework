@@ -73,6 +73,9 @@ function App() {
   const [selectedChain, setSelectedChain] = useState(null);
   const [chainExecution, setChainExecution] = useState(null);
   const [chainContext, setChainContext] = useState({ lhost: "", domain: "", user: "", pass: "" });
+  const [chainAutoExec, setChainAutoExec] = useState(false);
+  const [chainPolling, setChainPolling] = useState(false);
+  const chainPollRef = useRef(null);
   const terminalRef = useRef(null);
   const pollIntervalRef = useRef(null);
 
@@ -226,6 +229,76 @@ function App() {
   };
 
   const copyToClipboard = (text) => { navigator.clipboard.writeText(text); addTerminalLine("info", "Copied to clipboard"); };
+
+  const pollChainExecution = useCallback(async (executionId) => {
+    try {
+      const response = await axios.get(`${API}/chains/execution/${executionId}`);
+      const data = response.data;
+      setChainExecution(data);
+      
+      if (data.status === "running" && data.current_step > 0) {
+        const stepStatus = data.step_statuses?.[String(data.current_step)];
+        if (stepStatus?.status === "running") {
+          addTerminalLine("warning", `[CHAIN] Step ${data.current_step}/${data.total_steps}: ${stepStatus.step_name}...`);
+        } else if (stepStatus?.status === "completed") {
+          addTerminalLine("success", `[CHAIN] Step ${data.current_step} completed: ${stepStatus.step_name}`);
+        }
+      }
+      
+      if (data.status === "completed") {
+        if (chainPollRef.current) {
+          clearInterval(chainPollRef.current);
+          chainPollRef.current = null;
+        }
+        setChainPolling(false);
+        addTerminalLine("success", "═══ ATTACK CHAIN COMPLETED ═══");
+        data.results?.forEach(r => {
+          addTerminalLine("info", `  Step ${r.step_id} [${r.step_name}]: ${r.status?.toUpperCase()}`);
+        });
+      }
+    } catch (error) {
+      console.error("Chain poll error:", error);
+    }
+  }, [addTerminalLine]);
+
+  const executeChainAuto = async () => {
+    if (!selectedChain || !target) return;
+    addTerminalLine("command", `> AUTO-EXECUTING CHAIN: ${selectedChain.name}`);
+    addTerminalLine("info", `Target: ${target}`);
+    try {
+      const response = await axios.post(`${API}/chains/execute`, {
+        scan_id: currentScanId || "",
+        chain_id: selectedChain.id,
+        target: target,
+        context: chainContext,
+        auto_execute: true
+      });
+      setChainExecution(response.data);
+      setChainPolling(true);
+      addTerminalLine("success", `Chain started: ${response.data.execution_id}`);
+      
+      chainPollRef.current = setInterval(() => pollChainExecution(response.data.execution_id), 1500);
+    } catch (error) {
+      addTerminalLine("error", `Error: ${error.message}`);
+    }
+  };
+
+  const executeChainStep = async (executionId, stepId) => {
+    addTerminalLine("command", `> Executing step ${stepId}...`);
+    try {
+      const response = await axios.post(`${API}/chains/execution/${executionId}/step/${stepId}`);
+      addTerminalLine("success", `Step ${stepId} [${response.data.step_name}]: ${response.data.status?.toUpperCase()}`);
+      response.data.command_results?.forEach(cr => {
+        if (cr.output) addTerminalLine("info", `  ${cr.output}`);
+        if (cr.error) addTerminalLine("error", `  ${cr.error}`);
+      });
+      // Refresh execution status
+      const statusRes = await axios.get(`${API}/chains/execution/${executionId}`);
+      setChainExecution(statusRes.data);
+    } catch (error) {
+      addTerminalLine("error", `Step error: ${error.message}`);
+    }
+  };
 
   const downloadReport = async (scanId) => {
     try {
@@ -586,7 +659,7 @@ function App() {
                     <h3 className="text-[#FF003C] text-xs uppercase tracking-widest flex items-center gap-2">
                       <Link size={14} /> {selectedChain.name}
                     </h3>
-                    <button onClick={() => { setSelectedChain(null); setChainExecution(null); }} className="text-[#008F11] hover:text-[#FF003C]">
+                    <button onClick={() => { setSelectedChain(null); setChainExecution(null); if (chainPollRef.current) { clearInterval(chainPollRef.current); chainPollRef.current = null; } setChainPolling(false); }} className="text-[#008F11] hover:text-[#FF003C]" data-testid="chain-close-btn">
                       <XCircle size={16} />
                     </button>
                   </div>
@@ -596,80 +669,161 @@ function App() {
                   <div className="grid grid-cols-2 gap-2">
                     <div>
                       <label className="text-[10px] text-[#008F11] uppercase">LHOST (Your IP)</label>
-                      <input type="text" value={chainContext.lhost} onChange={(e) => setChainContext({...chainContext, lhost: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="10.10.14.x" />
+                      <input type="text" value={chainContext.lhost} onChange={(e) => setChainContext({...chainContext, lhost: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="10.10.14.x" data-testid="chain-lhost-input" />
                     </div>
                     <div>
                       <label className="text-[10px] text-[#008F11] uppercase">Domain</label>
-                      <input type="text" value={chainContext.domain} onChange={(e) => setChainContext({...chainContext, domain: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="CORP.LOCAL" />
+                      <input type="text" value={chainContext.domain} onChange={(e) => setChainContext({...chainContext, domain: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="CORP.LOCAL" data-testid="chain-domain-input" />
                     </div>
                     <div>
                       <label className="text-[10px] text-[#008F11] uppercase">User</label>
-                      <input type="text" value={chainContext.user} onChange={(e) => setChainContext({...chainContext, user: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="admin" />
+                      <input type="text" value={chainContext.user} onChange={(e) => setChainContext({...chainContext, user: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="admin" data-testid="chain-user-input" />
                     </div>
                     <div>
                       <label className="text-[10px] text-[#008F11] uppercase">Password</label>
-                      <input type="text" value={chainContext.pass} onChange={(e) => setChainContext({...chainContext, pass: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="********" />
+                      <input type="text" value={chainContext.pass} onChange={(e) => setChainContext({...chainContext, pass: e.target.value})} className="matrix-input w-full text-xs mt-1" placeholder="********" data-testid="chain-pass-input" />
                     </div>
                   </div>
 
-                  {/* Chain Steps */}
-                  <ScrollArea className="h-[200px]">
+                  {/* Execution Progress Pipeline */}
+                  {chainExecution && (
+                    <div className="p-2 border border-[#FF003C]/40" data-testid="chain-execution-panel">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[10px] text-[#FF003C] uppercase tracking-widest">EXECUTION: {chainExecution.status?.toUpperCase()}</span>
+                        <span className="text-[10px] text-[#008F11]">{chainExecution.progress || 0}%</span>
+                      </div>
+                      <Progress value={chainExecution.progress || 0} className="h-1 bg-[#0a140a] mb-2" />
+                      <div className="flex items-center gap-1 flex-wrap mb-2">
+                        {chainExecution.commands?.map((step, idx) => {
+                          const stepStatus = chainExecution.step_statuses?.[String(step.step_id)];
+                          const status = stepStatus?.status || "pending";
+                          const color = status === "completed" ? "#00FF41" : status === "running" ? "#FFB000" : status === "failed" ? "#FF003C" : "#008F11";
+                          return (
+                            <span key={step.step_id} className="flex items-center gap-1">
+                              <span className={`text-[10px] px-2 py-0.5 border ${status === "running" ? "animate-pulse" : ""}`} style={{ color, borderColor: `${color}60` }} data-testid={`chain-step-status-${step.step_id}`}>
+                                {status === "completed" ? "+" : status === "running" ? "~" : status === "failed" ? "X" : "."} S{step.step_id}
+                              </span>
+                              {idx < chainExecution.commands.length - 1 && <span className="text-[#008F11] text-[10px]">&gt;</span>}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Chain Steps with Execute Buttons */}
+                  <ScrollArea className="h-[180px]">
                     <div className="space-y-2">
-                      {selectedChain.steps?.map((step, idx) => (
-                        <div key={step.id} className="p-2 border border-[#FF003C]/30">
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs text-[#FF003C] font-bold">STEP {step.id}: {step.name}</span>
-                            <button 
-                              onClick={async () => {
-                                addTerminalLine("command", `> Executing Step ${step.id}: ${step.name}`);
-                                step.actions.forEach(action => {
-                                  addTerminalLine("info", `[CMD] ${action.cmd || action.module || 'N/A'}`);
-                                });
-                              }}
-                              className="text-[10px] text-[#00FF41] hover:underline"
-                            >
-                              [EXECUTE]
-                            </button>
-                          </div>
-                          <div className="mt-1 space-y-1">
-                            {step.actions?.map((action, aidx) => (
-                              <div key={aidx} className="text-[10px] text-[#008F11] bg-black/30 p-1 font-mono truncate">
-                                {action.tool && <span className="text-[#FFB000]">[{action.tool}] </span>}
-                                {action.cmd || action.module}
+                      {selectedChain.steps?.map((step) => {
+                        const stepStatus = chainExecution?.step_statuses?.[String(step.id)];
+                        const status = stepStatus?.status || "pending";
+                        const borderColor = status === "completed" ? "#00FF41" : status === "running" ? "#FFB000" : status === "failed" ? "#FF003C" : "rgba(255,0,60,0.3)";
+                        return (
+                          <div key={step.id} className={`p-2 border ${status === "running" ? "animate-pulse" : ""}`} style={{ borderColor }} data-testid={`chain-step-${step.id}`}>
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold flex items-center gap-2" style={{ color: status === "completed" ? "#00FF41" : status === "running" ? "#FFB000" : "#FF003C" }}>
+                                {status === "completed" ? <CheckCircle size={12} /> : status === "running" ? <RefreshCw size={12} className="animate-spin" /> : status === "failed" ? <XCircle size={12} /> : <ChevronRight size={12} />}
+                                STEP {step.id}: {step.name}
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] px-1 border" style={{ color: borderColor, borderColor: `${borderColor}60` }}>{status.toUpperCase()}</span>
+                                {chainExecution && status === "pending" && !chainPolling && (
+                                  <button 
+                                    onClick={() => executeChainStep(chainExecution.execution_id || chainExecution.id, step.id)}
+                                    className="text-[10px] text-[#FFB000] hover:text-[#FF003C] hover:underline"
+                                    data-testid={`exec-step-${step.id}`}
+                                  >
+                                    [RUN]
+                                  </button>
+                                )}
                               </div>
-                            ))}
+                            </div>
+                            <div className="mt-1 space-y-1">
+                              {step.actions?.map((action, aidx) => (
+                                <div key={aidx} className="flex items-center gap-1">
+                                  <div className="text-[10px] text-[#008F11] bg-black/30 p-1 font-mono truncate flex-1">
+                                    {action.tool && <span className="text-[#FFB000]">[{action.tool}] </span>}
+                                    {action.cmd || action.module}
+                                  </div>
+                                  <button onClick={() => copyToClipboard(action.cmd || action.module || "")} className="text-[#008F11] hover:text-[#00FF41] flex-shrink-0"><Copy size={10} /></button>
+                                </div>
+                              ))}
+                            </div>
+                            {/* Show step results if available */}
+                            {stepStatus?.command_results?.length > 0 && (
+                              <div className="mt-1 p-1 bg-black/50 border border-[#00FF41]/20">
+                                {stepStatus.command_results.map((cr, cri) => (
+                                  <div key={cri} className="text-[10px] font-mono">
+                                    {cr.output && <span className="text-[#00FF41]">{cr.output}</span>}
+                                    {cr.error && <span className="text-[#FF003C]">{cr.error}</span>}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </ScrollArea>
 
-                  <button
-                    onClick={async () => {
-                      addTerminalLine("command", `> Initiating Attack Chain: ${selectedChain.name}`);
-                      try {
-                        const response = await axios.post(`${API}/chains/execute`, {
-                          scan_id: currentScanId || "",
-                          chain_id: selectedChain.id,
-                          target: target,
-                          context: chainContext,
-                          auto_execute: false
-                        });
-                        setChainExecution(response.data);
-                        addTerminalLine("success", `Chain ready: ${response.data.execution_id}`);
-                        response.data.commands?.forEach((step, idx) => {
-                          addTerminalLine("info", `Step ${step.step_id}: ${step.step_name}`);
-                        });
-                      } catch (error) {
-                        addTerminalLine("error", `Error: ${error.message}`);
-                      }
-                    }}
-                    className="matrix-btn w-full justify-center text-xs"
-                    style={{ borderColor: "#FF003C", color: "#FF003C" }}
-                    disabled={!target}
-                  >
-                    <Link size={12} /> GENERATE CHAIN COMMANDS
-                  </button>
+                  {/* Action Buttons */}
+                  <div className="flex gap-2">
+                    {!chainExecution ? (
+                      <>
+                        <button
+                          onClick={async () => {
+                            addTerminalLine("command", `> Preparing Chain: ${selectedChain.name}`);
+                            try {
+                              const response = await axios.post(`${API}/chains/execute`, {
+                                scan_id: currentScanId || "",
+                                chain_id: selectedChain.id,
+                                target: target,
+                                context: chainContext,
+                                auto_execute: false
+                              });
+                              setChainExecution(response.data);
+                              addTerminalLine("success", `Chain ready: ${response.data.execution_id}`);
+                              addTerminalLine("info", `${response.data.total_steps} steps prepared. Use [RUN] per step or AUTO-EXECUTE all.`);
+                            } catch (error) {
+                              addTerminalLine("error", `Error: ${error.message}`);
+                            }
+                          }}
+                          className="matrix-btn flex-1 justify-center text-xs"
+                          style={{ borderColor: "#FFB000", color: "#FFB000" }}
+                          disabled={!target}
+                          data-testid="prepare-chain-btn"
+                        >
+                          <Crosshair size={12} /> PREPARE (MANUAL)
+                        </button>
+                        <button
+                          onClick={executeChainAuto}
+                          className="matrix-btn flex-1 justify-center text-xs"
+                          style={{ borderColor: "#FF003C", color: "#FF003C" }}
+                          disabled={!target}
+                          data-testid="auto-execute-chain-btn"
+                        >
+                          <Zap size={12} /> AUTO-EXECUTE
+                        </button>
+                      </>
+                    ) : chainExecution.status === "completed" ? (
+                      <div className="w-full p-2 border border-[#00FF41]/50 bg-[#00FF41]/5 text-center">
+                        <span className="text-xs text-[#00FF41] flex items-center justify-center gap-2"><CheckCircle size={14} /> CHAIN EXECUTION COMPLETE</span>
+                      </div>
+                    ) : chainExecution.status === "running" ? (
+                      <div className="w-full p-2 border border-[#FFB000]/50 bg-[#FFB000]/5 text-center">
+                        <span className="text-xs text-[#FFB000] flex items-center justify-center gap-2"><RefreshCw size={14} className="animate-spin" /> EXECUTING... Step {chainExecution.current_step}/{chainExecution.total_steps}</span>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={executeChainAuto}
+                        className="matrix-btn w-full justify-center text-xs"
+                        style={{ borderColor: "#FF003C", color: "#FF003C" }}
+                        data-testid="run-all-chain-btn"
+                      >
+                        <Zap size={12} /> RUN ALL REMAINING
+                      </button>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-2">
@@ -681,11 +835,13 @@ function App() {
                         try {
                           const response = await axios.get(`${API}/chains/${chain.id}`);
                           setSelectedChain({ id: chain.id, ...response.data });
+                          setChainExecution(null);
                         } catch (error) {
                           addTerminalLine("error", `Error loading chain: ${error.message}`);
                         }
                       }}
                       className="p-3 border border-[#FF003C]/30 hover:border-[#FF003C] cursor-pointer transition-all"
+                      data-testid={`chain-card-${chain.id}`}
                     >
                       <div className="flex items-center justify-between">
                         <span className="text-xs text-[#FF003C] font-bold">{chain.name}</span>

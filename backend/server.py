@@ -1225,6 +1225,16 @@ async def execute_chain(request: ChainExecutionRequest, background_tasks: Backgr
     context = {"target": request.target, "lhost": request.context.get("lhost", ""), **request.context}
     commands = AttackChainEngine.generate_chain_commands(request.chain_id, context)
     
+    # Build initial step statuses
+    step_statuses = {}
+    for cmd in commands:
+        step_statuses[str(cmd["step_id"])] = {
+            "step_id": cmd["step_id"],
+            "step_name": cmd["step_name"],
+            "status": "pending",
+            "command_results": []
+        }
+    
     active_chains[execution_id] = {
         "id": execution_id,
         "scan_id": request.scan_id,
@@ -1234,7 +1244,9 @@ async def execute_chain(request: ChainExecutionRequest, background_tasks: Backgr
         "status": "ready",
         "current_step": 0,
         "total_steps": len(commands),
+        "progress": 0,
         "commands": commands,
+        "step_statuses": step_statuses,
         "results": [],
         "created_at": datetime.now(timezone.utc).isoformat()
     }
@@ -1249,50 +1261,93 @@ async def execute_chain(request: ChainExecutionRequest, background_tasks: Backgr
         "chain_id": request.chain_id,
         "chain_name": chain["name"],
         "status": active_chains[execution_id]["status"],
+        "total_steps": len(commands),
+        "step_statuses": step_statuses,
         "commands": commands
     }
 
 async def run_chain_background(execution_id: str):
-    """Background task to execute chain steps"""
+    """Background task to execute chain steps with real-time tracking"""
+    import asyncio
     chain_exec = active_chains.get(execution_id)
     if not chain_exec:
         return
     
+    chain_exec["started_at"] = datetime.now(timezone.utc).isoformat()
+    total_steps = len(chain_exec["commands"])
+    
     for i, step in enumerate(chain_exec["commands"]):
         chain_exec["current_step"] = i + 1
-        step_results = {"step_id": step["step_id"], "step_name": step["step_name"], "command_results": []}
+        chain_exec["progress"] = int((i / total_steps) * 100)
         
+        # Mark step as running
+        step_status = {
+            "step_id": step["step_id"],
+            "step_name": step["step_name"],
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "command_results": []
+        }
+        
+        # Update step_statuses
+        if "step_statuses" not in chain_exec:
+            chain_exec["step_statuses"] = {}
+        chain_exec["step_statuses"][str(step["step_id"])] = step_status
+        
+        step_success = True
         for cmd in step["commands"]:
             try:
                 if cmd.get("module"):
-                    # Metasploit module
                     result = await run_metasploit(cmd["module"], chain_exec["target"], None, {}, chain_exec.get("lhost"), 4444)
                 else:
-                    # Shell command (simulated)
+                    # Simulate command execution with delay
+                    await asyncio.sleep(1)
                     result = {
                         "command": cmd["command"],
+                        "tool": cmd.get("tool", "shell"),
                         "simulated": True,
-                        "output": f"[SIMULATED] {cmd['command'][:100]}..."
+                        "success": True,
+                        "output": f"[SIM] Executed: {cmd['command'][:120]}"
                     }
-                step_results["command_results"].append(result)
+                step_status["command_results"].append(result)
             except Exception as e:
-                step_results["command_results"].append({"error": str(e)})
+                step_status["command_results"].append({"error": str(e), "success": False})
+                step_success = False
         
-        chain_exec["results"].append(step_results)
+        step_status["status"] = "completed" if step_success else "failed"
+        step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+        chain_exec["results"].append(step_status)
+        
+        # Brief pause between steps for realism
+        await asyncio.sleep(0.5)
     
     chain_exec["status"] = "completed"
+    chain_exec["progress"] = 100
+    chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
     
     # Save to database
-    await db.chain_executions.insert_one({
-        "id": execution_id,
-        **chain_exec
-    })
+    save_data = {k: v for k, v in chain_exec.items()}
+    await db.chain_executions.insert_one({"id": execution_id, **save_data})
 
 @api_router.get("/chains/execution/{execution_id}")
 async def get_chain_execution_status(execution_id: str):
-    """Get status of a chain execution"""
+    """Get status of a chain execution with step-level progress"""
     if execution_id in active_chains:
-        return active_chains[execution_id]
+        chain = active_chains[execution_id]
+        return {
+            "id": chain["id"],
+            "chain_id": chain["chain_id"],
+            "chain_name": chain["chain_name"],
+            "target": chain["target"],
+            "status": chain["status"],
+            "current_step": chain["current_step"],
+            "total_steps": chain["total_steps"],
+            "progress": chain.get("progress", 0),
+            "step_statuses": chain.get("step_statuses", {}),
+            "results": chain.get("results", []),
+            "created_at": chain.get("created_at"),
+            "completed_at": chain.get("completed_at")
+        }
     
     exec_doc = await db.chain_executions.find_one({"id": execution_id}, {"_id": 0})
     if exec_doc:
@@ -1307,7 +1362,6 @@ async def execute_chain_step(execution_id: str, step_id: int):
     if not chain_exec:
         raise HTTPException(status_code=404, detail="Execution not found")
     
-    # Find the step
     step = None
     for s in chain_exec["commands"]:
         if s["step_id"] == step_id:
@@ -1317,20 +1371,50 @@ async def execute_chain_step(execution_id: str, step_id: int):
     if not step:
         raise HTTPException(status_code=404, detail="Step not found")
     
-    step_results = {"step_id": step_id, "step_name": step["step_name"], "command_results": []}
+    # Update step status to running
+    if "step_statuses" not in chain_exec:
+        chain_exec["step_statuses"] = {}
+    chain_exec["step_statuses"][str(step_id)] = {
+        "step_id": step_id,
+        "step_name": step["step_name"],
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "command_results": []
+    }
+    
+    step_results = chain_exec["step_statuses"][str(step_id)]
+    step_success = True
     
     for cmd in step["commands"]:
         try:
             if cmd.get("module"):
                 result = await run_metasploit(cmd["module"], chain_exec["target"], None, {}, None, 4444)
             else:
-                result = {"command": cmd["command"], "simulated": True, "output": f"[SIMULATED] {cmd['command'][:100]}..."}
+                result = {
+                    "command": cmd["command"],
+                    "tool": cmd.get("tool", "shell"),
+                    "simulated": True,
+                    "success": True,
+                    "output": f"[SIM] Executed: {cmd['command'][:120]}"
+                }
             step_results["command_results"].append(result)
         except Exception as e:
-            step_results["command_results"].append({"error": str(e)})
+            step_results["command_results"].append({"error": str(e), "success": False})
+            step_success = False
     
+    step_results["status"] = "completed" if step_success else "failed"
+    step_results["completed_at"] = datetime.now(timezone.utc).isoformat()
     chain_exec["results"].append(step_results)
     chain_exec["current_step"] = step_id
+    
+    # Update progress
+    completed_steps = sum(1 for s in chain_exec.get("step_statuses", {}).values() if s.get("status") in ["completed", "failed"])
+    chain_exec["progress"] = int((completed_steps / chain_exec["total_steps"]) * 100)
+    
+    # Check if all steps done
+    if completed_steps >= chain_exec["total_steps"]:
+        chain_exec["status"] = "completed"
+        chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
     
     return step_results
 
