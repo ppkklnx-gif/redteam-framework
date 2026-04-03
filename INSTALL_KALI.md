@@ -75,7 +75,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # Instalar dependencias (solo las necesarias, no todo el freeze)
-pip install fastapi uvicorn motor python-dotenv httpx pydantic
+pip install fastapi uvicorn motor python-dotenv httpx pydantic fpdf2 pymetasploit3 sliver-py websockets
 
 # Configurar .env (ya viene configurado, solo verificar)
 cat .env
@@ -87,6 +87,10 @@ MONGO_URL="mongodb://localhost:27017"
 DB_NAME="redteam_db"
 CORS_ORIGINS="http://localhost:3000"
 KIMI_API_KEY="sk-4zTj5qtLiyJTrzGPmf7DQYsFMplk2B5QvvP69EPJb3N3fwDQ"
+MSF_RPC_TOKEN="13nHJ54CoGYr5jCeI0iXXU4YsAnkItfv"
+MSF_RPC_HOST="127.0.0.1"
+MSF_RPC_PORT="55553"
+SLIVER_CONFIG_PATH=""
 ```
 
 **Iniciar el backend:**

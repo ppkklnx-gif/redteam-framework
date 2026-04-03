@@ -46,15 +46,20 @@ MONGO_URL="mongodb://localhost:27017"
 DB_NAME="redteam_db"
 CORS_ORIGINS="http://localhost:3000"
 KIMI_API_KEY="sk-4zTj5qtLiyJTrzGPmf7DQYsFMplk2B5QvvP69EPJb3N3fwDQ"
+MSF_RPC_TOKEN="13nHJ54CoGYr5jCeI0iXXU4YsAnkItfv"
+MSF_RPC_HOST="127.0.0.1"
+MSF_RPC_PORT="55553"
+SLIVER_CONFIG_PATH=""
 ```
 
 NOTAS:
 - MONGO_URL: Solo cambiar si MongoDB corre en otro host/puerto
 - DB_NAME: Puedes poner el nombre que quieras para la base de datos
 - CORS_ORIGINS: DEBE ser "http://localhost:3000" para desarrollo local
-  (en la nube estaba con "*" pero localmente usar la URL del frontend)
-- KIMI_API_KEY: Ya viene configurada. Es la API key de Moonshot AI (Kimi K2).
-  Si la key expira, obtener nueva en https://platform.moonshot.cn/
+- KIMI_API_KEY: Ya viene configurada. API key de Moonshot AI (Kimi K2)
+- MSF_RPC_TOKEN: Tu token para msfrpcd (ya configurado)
+- MSF_RPC_HOST/PORT: Host y puerto del msfrpcd (default 127.0.0.1:55553)
+- SLIVER_CONFIG_PATH: Ruta al config de operador Sliver (dejar vacio si no lo usas)
 
 ### 3.2 Archivo: frontend/.env
 
@@ -78,7 +83,7 @@ Backend:
 cd backend
 python3 -m venv venv
 source venv/bin/activate
-pip install fastapi uvicorn motor python-dotenv httpx pydantic fpdf2
+pip install fastapi uvicorn motor python-dotenv httpx pydantic fpdf2 pymetasploit3 sliver-py websockets
 ```
 
 Frontend:
@@ -329,6 +334,48 @@ En server.py, agregar a TacticalDecisionEngine.SERVICE_ATTACK_MAP
 - Se muestran en el tab AI como tarjetas clickeables
 - Se anuncian en el terminal
 
+### Cambio 5: Integracion con Metasploit RPC (msfrpcd) - NUEVO
+- Se conecto al daemon RPC de Metasploit para control real
+- En tu Kali ejecuta: msfrpcd -P 13nHJ54CoGYr5jCeI0iXXU4YsAnkItfv -S -a 127.0.0.1
+- Permite:
+  * Buscar modulos directamente del MSF instalado (no solo los precargados)
+  * Ejecutar exploits via RPC (con job tracking)
+  * Ver y controlar sesiones activas (Meterpreter, shell)
+  * Ejecutar comandos en sesiones abiertas
+  * Ver y matar jobs activos
+- Tab C2 > Seccion METASPLOIT RPC
+
+### Cambio 6: WebSocket para Actualizaciones en Tiempo Real - NUEVO
+- Antes: Frontend preguntaba "ya terminaste?" cada 2 segundos (polling)
+- Ahora: Backend avisa instantaneamente cuando algo pasa (WebSocket)
+- Endpoints WS: /api/ws/scan/{id} y /api/ws/chain/{id}
+- Fallback automatico a polling si WebSocket falla
+- Los resultados del escaneo aparecen en tiempo real sin delay
+
+### Cambio 7: Integracion con Sliver C2 - NUEVO
+- Framework de Command & Control open source para post-explotacion
+- Para activar en tu Kali:
+  1. curl https://sliver.sh/install|sudo bash
+  2. sliver-server
+  3. new-operator --name redteam --lhost 127.0.0.1
+  4. Pon la ruta del config en SLIVER_CONFIG_PATH en backend/.env
+- Permite:
+  * Ver sesiones y beacons activos
+  * Generar implants (Session o Beacon) para Linux/Windows/macOS
+  * Ejecutar comandos en sesiones de Sliver
+  * Iniciar listeners (mTLS, HTTPS, HTTP, DNS)
+  * Ver implants generados
+- Tab C2 > Seccion SLIVER C2
+
+### Cambio 8: Tab C2 Unificado - NUEVO
+- Nuevo tab "C2" en la interfaz con dashboard unificado
+- Muestra status de MSF RPC y Sliver en un solo lugar
+- Busqueda de modulos MSF via RPC
+- Shell interactiva para sesiones (MSF y Sliver)
+- Generador de implants Sliver con config visual
+- Botones de Quick Start Listeners
+- Indicadores MSF:ON y SLIVER:ON en la barra de status
+
 ---
 
 ## 9. API ENDPOINTS COMPLETOS
@@ -353,11 +400,30 @@ En server.py, agregar a TacticalDecisionEngine.SERVICE_ATTACK_MAP
 | POST | /api/chains/execution/{id}/step/{step_id} | Ejecutar paso individual |
 | POST | /api/chains/detect | Detectar chains aplicables segun hallazgos |
 | POST | /api/chains/{id}/generate | Generar comandos con variables de contexto |
-| GET | /api/metasploit/modules | Listar modulos MSF (filtrable) |
-| POST | /api/metasploit/execute | Ejecutar modulo MSF |
+| GET | /api/metasploit/modules | Listar modulos MSF estaticos (filtrable) |
+| POST | /api/metasploit/execute | Ejecutar modulo MSF via subprocess |
 | GET | /api/tactical/waf-bypass/{waf} | Estrategias de bypass para WAF especifico |
 | GET | /api/tactical/service-attacks | Mapeo servicio -> ataque |
 | GET | /api/tactical/vuln-exploits | Mapeo vulnerabilidad -> exploit |
+| **WS** | **/api/ws/scan/{id}** | **WebSocket tiempo real para escaneos** |
+| **WS** | **/api/ws/chain/{id}** | **WebSocket tiempo real para cadenas** |
+| **GET** | **/api/msf/status** | **Status conexion msfrpcd** |
+| **POST** | **/api/msf/connect** | **Reconectar a msfrpcd** |
+| **GET** | **/api/msf/search?query=** | **Buscar modulos via RPC** |
+| **GET** | **/api/msf/module/info** | **Info detallada de modulo via RPC** |
+| **POST** | **/api/msf/module/execute** | **Ejecutar modulo via RPC** |
+| **GET** | **/api/msf/sessions** | **Listar sesiones MSF activas** |
+| **POST** | **/api/msf/session/command** | **Ejecutar comando en sesion MSF** |
+| **GET** | **/api/msf/jobs** | **Listar jobs MSF activos** |
+| **POST** | **/api/msf/job/kill** | **Matar job MSF** |
+| **GET** | **/api/sliver/status** | **Status conexion Sliver** |
+| **GET** | **/api/sliver/sessions** | **Listar sesiones Sliver** |
+| **GET** | **/api/sliver/beacons** | **Listar beacons Sliver** |
+| **GET** | **/api/sliver/implants** | **Listar implants generados** |
+| **POST** | **/api/sliver/implant/generate** | **Generar implant Sliver** |
+| **POST** | **/api/sliver/session/exec** | **Ejecutar comando en sesion Sliver** |
+| **POST** | **/api/sliver/listener/start** | **Iniciar listener Sliver** |
+| **GET** | **/api/c2/dashboard** | **Dashboard unificado MSF + Sliver** |
 
 ---
 
