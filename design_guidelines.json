@@ -1,82 +1,115 @@
 {
   "theme": "dark",
-  "archetype": "7 (Electric & Neon) - Retro-Futurism Terminal Look",
-  "global_rules": [
-    "All text must be legible and meet contrast ratios. Use text-shadow for glow, but do not make it blurry.",
-    "Borders must be 1px solid, sharp edges (rounded-none).",
-    "Include data-testid attributes (kebab-case, role-based) on all interactive elements.",
-    "Do not use card components with soft shadows or border-radius. Use flat, rectangular, terminal-like panes.",
-    "Use uppercase for labels, overlines, and buttons with wide tracking (tracking-widest)."
-  ],
+  "archetype": "Archetype 7: Electric & Neon",
+  "design_philosophy": "Tactical, professional red team tool with a modern cyberpunk/matrix aesthetic. Focus on high-density data, real-time feedback, operational clarity, and high-contrast terminal elements.",
   "colors": {
-    "background_base": "#020402",
-    "surface_panel": "#050a05",
-    "surface_highlight": "#0a140a",
-    "primary": "#00FF41",
-    "primary_dark": "#008F11",
-    "text_active": "#00FF41",
-    "text_muted": "#005A0B",
-    "accent_danger": "#FF003C",
-    "accent_warning": "#FFB000",
-    "accent_ai": "#00F0FF",
-    "border_default": "rgba(0, 255, 65, 0.3)",
-    "border_active": "rgba(0, 255, 65, 0.8)"
-  },
-  "typography": {
-    "font_family_primary": "'JetBrains Mono', 'Fira Code', monospace",
-    "font_family_secondary": "'Fira Code', 'Courier New', monospace",
-    "font_family_display": "'VT323', monospace",
-    "h1": "text-4xl md:text-5xl font-display uppercase tracking-widest text-[#00FF41] drop-shadow-[0_0_8px_rgba(0,255,65,0.6)]",
-    "h2": "text-2xl md:text-3xl font-primary uppercase tracking-wider text-[#00FF41]",
-    "h3": "text-xl font-primary uppercase tracking-wide text-[#00FF41]",
-    "body": "text-sm md:text-base font-secondary text-[#00FF41]",
-    "label": "text-xs font-primary uppercase tracking-[0.2em] text-[#008F11]"
-  },
-  "surfaces_and_components": {
-    "panel": "bg-[#050a05] border border-[#00FF41]/30 p-4 relative overflow-hidden before:absolute before:inset-0 before:bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.25)_50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] before:bg-[length:100%_4px,3px_100%] before:pointer-events-none",
-    "panel_ai": "bg-[#000a14] border border-[#00F0FF]/40 p-4 relative shadow-[0_0_15px_rgba(0,240,255,0.1)_inset]",
-    "button_primary": "bg-transparent border border-[#00FF41] text-[#00FF41] px-6 py-2 uppercase tracking-widest font-bold hover:bg-[#00FF41] hover:text-black hover:shadow-[0_0_15px_rgba(0,255,65,0.6)] transition-all duration-200 cursor-pointer flex items-center gap-2",
-    "button_danger": "bg-transparent border border-[#FF003C] text-[#FF003C] px-6 py-2 uppercase tracking-widest font-bold hover:bg-[#FF003C] hover:text-black hover:shadow-[0_0_15px_rgba(255,0,60,0.6)] transition-all duration-200",
-    "input_field": "bg-black/50 border border-[#00FF41]/30 text-[#00FF41] px-4 py-2 font-secondary focus:outline-none focus:border-[#00FF41] focus:shadow-[0_0_10px_rgba(0,255,65,0.3)] placeholder:text-[#005A0B] w-full rounded-none",
-    "table": "w-full text-left font-secondary text-sm border-collapse",
-    "table_header": "border-b border-[#00FF41]/50 text-[#008F11] uppercase tracking-wider pb-2",
-    "table_row": "border-b border-[#00FF41]/20 hover:bg-[#00FF41]/10 transition-colors",
-    "badge_critical": "bg-[#FF003C]/20 text-[#FF003C] border border-[#FF003C]/50 px-2 py-0.5 text-xs uppercase",
-    "badge_high": "bg-[#FFB000]/20 text-[#FFB000] border border-[#FFB000]/50 px-2 py-0.5 text-xs uppercase",
-    "terminal_output": "bg-black p-4 font-secondary text-sm text-[#00FF41] h-64 overflow-y-auto border border-[#00FF41]/20 custom-scrollbar"
-  },
-  "layout_and_spacing": {
-    "grid_system": "Control Room Grid. grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 h-full p-4",
-    "spacing_scale": "Dense. Use p-4 for panels, gap-4 for grids. Everything should feel compact and functional.",
-    "specific_spans": {
-      "target_input": "col-span-full mb-4",
-      "terminal_output": "col-span-full lg:col-span-2 row-span-2",
-      "ai_analysis": "col-span-full lg:col-span-2 row-span-1",
-      "vulnerability_list": "col-span-full lg:col-span-2 row-span-1"
+    "background": {
+      "base": "#030504",
+      "surface": "#070E0A",
+      "surface_hover": "#0C1A12",
+      "panel": "#020302"
+    },
+    "text": {
+      "primary": "#00FF41",
+      "secondary": "#8BBE95",
+      "muted": "#2F4F38",
+      "inverse": "#000000"
+    },
+    "accents": {
+      "primary": "#00FF41",
+      "success": "#00FF41",
+      "alert": "#FF003C",
+      "warning": "#FFB000",
+      "info": "#00F0FF",
+      "border": "rgba(0, 255, 65, 0.25)",
+      "border_focus": "rgba(0, 255, 65, 0.8)",
+      "glow": "rgba(0, 255, 65, 0.15)"
     }
   },
-  "visual_enhancers": {
-    "scanlines": "MANDATORY overlay on main panels. pointer-events-none, repeating-linear-gradient to simulate CRT monitor.",
-    "glow_effects": "Use CSS drop-shadow on headings and active buttons. Avoid heavy blur on text to maintain legibility.",
-    "blinking_cursor": "Simulate a terminal cursor `_` at the end of active inputs or loading terminal lines with an infinite blink animation.",
-    "ascii_art": "Use ASCII art for the main logo or empty states."
+  "typography": {
+    "heading_font": "JetBrains Mono, monospace",
+    "body_font": "JetBrains Mono, monospace",
+    "scales": {
+      "h1": "text-2xl tracking-tighter uppercase font-black",
+      "h2": "text-xl tracking-tight uppercase font-bold",
+      "h3": "text-lg uppercase font-semibold",
+      "body": "text-sm",
+      "small": "text-xs tracking-[0.2em] uppercase"
+    }
   },
-  "motion_and_interactions": {
-    "hover": "Instant hard transitions for colors, subtle glow expansion.",
-    "loading": "Matrix digital rain effect or simple ASCII spinner (|, /, -, \\).",
-    "terminal_typing": "New lines in the terminal should appear sequentially, simulating actual stdout."
+  "spacing_and_layout": {
+    "grid_strategy": "Control Room Grid (Dense & Tactical)",
+    "gap": "gap-4 md:gap-6",
+    "padding": "p-4 md:p-6",
+    "corners": "rounded-none",
+    "layout_structure": {
+      "dashboard": "grid-cols-1 md:grid-cols-12",
+      "sidebar": "col-span-12 md:col-span-2",
+      "main_content": "col-span-12 md:col-span-10"
+    }
   },
-  "icons": {
-    "library": "lucide-react",
-    "style": "Sharp, angular icons. Size 16px or 20px. Color matches text."
+  "surface_styles": {
+    "primary_panel": {
+      "background": "bg-[#070E0A]",
+      "border": "border border-[#00FF41]/25",
+      "shadow": "shadow-[0_0_10px_rgba(0,255,65,0.05),inset_0_0_20px_rgba(0,255,65,0.02)]",
+      "effects": "relative overflow-hidden before:absolute before:inset-0 before:bg-[linear-gradient(transparent_50%,rgba(0,255,65,0.02)_50%)] before:bg-[length:100%_4px] before:pointer-events-none"
+    },
+    "interactive_element": {
+      "hover": "hover:bg-[#0C1A12] hover:border-[#00FF41]/70 hover:shadow-[0_0_15px_rgba(0,255,65,0.2)] transition-all duration-200",
+      "active": "active:scale-[0.98]"
+    }
   },
-  "instructions_to_main_agent": {
-    "1": "Use React + Tailwind CSS. Ensure you use .js/.jsx files as requested by the system (not .tsx).",
-    "2": "Avoid pre-built Shadcn components if they use rounded corners or soft shadows; customize them heavily to be sharp, flat, and neon-bordered if used.",
-    "3": "For the layout, implement a full-screen dashboard (h-screen, overflow-hidden on body) where panels scroll internally, resembling a real command center.",
-    "4": "Every interactive element MUST have a `data-testid` attribute (e.g., `data-testid=\"start-scan-button\"`).",
-    "5": "The AI Analysis Panel (Kimi K2) should stand out slightly by using the accent_ai color (#00F0FF) for borders and key text to contrast with the Matrix green.",
-    "6": "Implement custom scrollbars in index.css: width 8px, background #050a05, thumb #00FF41, no rounded corners.",
-    "7": "Add a global scanline overlay to the `body` or main wrapper to enforce the cyberpunk terminal aesthetic."
+  "components_instructions": {
+    "global": {
+      "override_shadcn": "Override all default Shadcn border radii to `rounded-none`. Strip out gray default borders and replace with `border-[#00FF41]/25`.",
+      "testing": "All interactive elements MUST have `data-testid` attributes (e.g., `data-testid=\"toggle-autonomous-mode\"`)."
+    },
+    "dashboard_cards": {
+      "style": "Retro-Futurism Terminal Look. Sharp square corners, 1px solid neon green/25 borders.",
+      "content": "Use bright green for primary metrics, muted green for labels. Avoid generic icons; use technical glyphs."
+    },
+    "terminal_logs": {
+      "container": "bg-[#020302] border border-[#00FF41]/30 font-mono text-xs p-4 h-full overflow-y-auto scrollbar-hide",
+      "text_colors": "Prefix commands with `$` in cyan (`#00F0FF`). Success logs in green, errors in red (`#FF003C`), info in muted green."
+    },
+    "attack_graph": {
+      "library": "react-force-graph-2d or custom SVG/Framer Motion",
+      "instructions": "Pitch black background. Nodes represent systems. Color coding: Red (uncompromised target), Yellow (in progress/scanning), Green (compromised/session active). Links should be low opacity cyan, turning bright green when lateral movement is successful."
+    },
+    "attack_chain_pipeline": {
+      "library": "react-flow-renderer or Flexbox with SVG arrows",
+      "instructions": "Horizontal pipeline nodes: [SCAN] -> [ENUM] -> [EXPLOIT] -> [POST]. Active node glows neon green, pending nodes are dim outlined, failed nodes pulse neon red."
+    },
+    "c2_console": {
+      "style": "Split pane: Left side shows active sessions (green IPs, OS identifiers), Right side is the interactive command terminal."
+    },
+    "ai_decision_panel": {
+      "style": "High-contrast tactical panel. AI suggestions appear via Framer Motion typewriter effect. 'ACCEPT' button in solid green (`bg-[#00FF41] text-black`), 'IGNORE' button with red outline (`border-[#FF003C] text-[#FF003C]`)."
+    },
+    "autonomous_mode_toggle": {
+      "style": "Massive, highly visible switch/button. When OFF: dim red border. When ON: Intense neon green glow (`shadow-[0_0_30px_rgba(0,255,65,0.5)]`), pulsing effect, text changes to 'AUTONOMOUS APT ENGAGED'."
+    }
+  },
+  "libraries_required": [
+    "lucide-react",
+    "framer-motion",
+    "react-force-graph-2d",
+    "react-flow-renderer",
+    "clsx",
+    "tailwind-merge"
+  ],
+  "accessibility_and_interactions": {
+    "focus_states": "focus:outline-none focus:ring-1 focus:ring-[#00FF41] focus:ring-offset-1 focus:ring-offset-[#030504]",
+    "animations": "Subtle pulsing for active attacks. Matrix rain or scanline CSS overlay for background texture. Avoid overly bouncy physics; motion should be rigid, instant, and tactical."
+  },
+  "media": {
+    "images": [
+      {
+        "category": "background",
+        "description": "Terminal-style UI relies entirely on CSS repeating-linear-gradient for scanlines, noise textures, and pure hex colors. No external raster background image is required to maintain maximum rendering performance and sharp technical aesthetic.",
+        "url": null
+      }
+    ]
   }
 }
