@@ -84,10 +84,48 @@ CREATE TABLE IF NOT EXISTS events (
     timestamp TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS chain_executions (
+    id TEXT PRIMARY KEY,
+    chain_id TEXT NOT NULL,
+    chain_name TEXT,
+    scan_id TEXT,
+    target TEXT,
+    status TEXT NOT NULL DEFAULT 'ready',
+    progress INTEGER DEFAULT 0,
+    current_step INTEGER DEFAULT 0,
+    total_steps INTEGER DEFAULT 0,
+    commands TEXT,
+    step_statuses TEXT,
+    results TEXT,
+    context TEXT,
+    vault_summary TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS custom_tools (
+    id TEXT PRIMARY KEY,
+    phase TEXT,
+    mitre TEXT,
+    cmd TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_modules (
+    name TEXT PRIMARY KEY,
+    description TEXT,
+    rank TEXT DEFAULT 'normal',
+    category TEXT DEFAULT 'exploit',
+    mitre TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id);
 CREATE INDEX IF NOT EXISTS idx_scans_job ON scans(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_chain_exec_scan ON chain_executions(scan_id);
 """
 
 
@@ -330,3 +368,90 @@ async def is_healthy() -> bool:
         return bool(rows)
     except Exception:
         return False
+
+
+# ─── Scan Delete ─────────────────────────────────────────
+
+async def scan_delete(scan_id: str):
+    await _db.execute("DELETE FROM scans WHERE id=?", (scan_id,))
+    await _db.execute("DELETE FROM credentials WHERE scan_id=?", (scan_id,))
+    await _db.commit()
+
+
+# ─── Chain Execution Repository ──────────────────────────
+
+async def chain_exec_create(exec_id: str, chain_id: str, chain_name: str, scan_id: str,
+                            target: str, commands: Any, step_statuses: Any, total_steps: int,
+                            context: Any = None) -> Dict:
+    now = _now()
+    await _db.execute(
+        """INSERT INTO chain_executions(id,chain_id,chain_name,scan_id,target,status,
+           commands,step_statuses,total_steps,context,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (exec_id, chain_id, chain_name, scan_id, target, "ready",
+         _json(commands), _json(step_statuses), total_steps, _json(context), now)
+    )
+    await _db.commit()
+    return {"id": exec_id, "chain_id": chain_id, "status": "ready", "created_at": now}
+
+
+async def chain_exec_update(exec_id: str, **kwargs):
+    sets = []
+    vals = []
+    for k, v in kwargs.items():
+        if k in ("commands", "step_statuses", "results", "context", "vault_summary"):
+            v = _json(v)
+        sets.append(f"{k}=?")
+        vals.append(v)
+    vals.append(exec_id)
+    await _db.execute(f"UPDATE chain_executions SET {','.join(sets)} WHERE id=?", vals)
+    await _db.commit()
+
+
+async def chain_exec_get(exec_id: str) -> Optional[Dict]:
+    rows = await _db.execute_fetchall("SELECT * FROM chain_executions WHERE id=?", (exec_id,))
+    if not rows:
+        return None
+    d = _row_to_dict(rows[0])
+    for k in ("commands", "step_statuses", "results", "context", "vault_summary"):
+        d[k] = _parse(d.get(k))
+    return d
+
+
+# ─── Custom Tool Repository ─────────────────────────────
+
+async def custom_tool_upsert(tool_id: str, phase: str, mitre: str, cmd: str, desc: str):
+    now = _now()
+    await _db.execute(
+        """INSERT INTO custom_tools(id,phase,mitre,cmd,description,created_at)
+           VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET phase=?,mitre=?,cmd=?,description=?""",
+        (tool_id, phase, mitre, cmd, desc, now, phase, mitre, cmd, desc)
+    )
+    await _db.commit()
+
+
+async def custom_tool_delete(tool_id: str):
+    await _db.execute("DELETE FROM custom_tools WHERE id=?", (tool_id,))
+    await _db.commit()
+
+
+async def custom_tools_list() -> List[Dict]:
+    rows = await _db.execute_fetchall("SELECT * FROM custom_tools")
+    return [_row_to_dict(r) for r in rows]
+
+
+# ─── Custom Module Repository ────────────────────────────
+
+async def custom_module_upsert(name: str, desc: str, rank: str, category: str, mitre: str):
+    now = _now()
+    await _db.execute(
+        """INSERT INTO custom_modules(name,description,rank,category,mitre,created_at)
+           VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET description=?,rank=?,category=?,mitre=?""",
+        (name, desc, rank, category, mitre, now, desc, rank, category, mitre)
+    )
+    await _db.commit()
+
+
+async def custom_modules_list() -> List[Dict]:
+    rows = await _db.execute_fetchall("SELECT * FROM custom_modules")
+    return [_row_to_dict(r) for r in rows]

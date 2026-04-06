@@ -167,13 +167,21 @@ class CredentialVault:
         return os_info
     
     async def save_to_db(self, scan_id: str):
-        """Persist vault contents to MongoDB"""
-        if self.db and scan_id in self._artifacts:
-            await self.db.credentials.update_one(
-                {"scan_id": scan_id},
-                {"$set": {"scan_id": scan_id, **self._artifacts[scan_id]}},
-                upsert=True
-            )
+        """Persist vault credentials to SQLite via db module"""
+        try:
+            import db as repo
+            if scan_id in self._artifacts:
+                for cred in self._artifacts[scan_id].get("credentials", []):
+                    await repo.credential_add(
+                        scan_id=scan_id,
+                        cred_type=cred.get("type", ""),
+                        username=cred.get("username", ""),
+                        value=cred.get("value", ""),
+                        source=cred.get("source", ""),
+                        target=cred.get("host", "")
+                    )
+        except Exception as e:
+            logger.warning(f"[VAULT] Failed to persist credentials: {e}")
     
     def get_vault_summary(self, scan_id: str) -> Dict:
         """Get summary of vault contents"""

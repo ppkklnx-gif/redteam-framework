@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, Optional
 
-from . import db
+import db
 
 logger = logging.getLogger("redteam.jobs")
 

