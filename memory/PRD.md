@@ -1,64 +1,36 @@
-# Red Team Automation Framework — PRD
+# Red Team Automation Framework — PRD v7.0
 
 ## Problem Statement
-Automated Red Team / pentesting framework with adaptive scanning, AI-driven tactical analysis, attack chain execution, and C2 integration (Metasploit RPC + Sliver). The framework uses a Local-First architecture: SQLite database, async Job system, and robust operational scripts. No Docker required for core operations.
+Automated Red Team / pentesting framework with **AI-driven** adaptive scanning. The AI (Kimi K2) decides which tool to run next based on results. Local-First: SQLite, async Jobs, no Docker, no msfrpcd/Sliver RPC dependencies.
 
-## Architecture (v6.0 — Local-First)
-- **Backend**: FastAPI (Python) + SQLite (aiosqlite) + Async Job System
-- **Frontend**: React 19 + TailwindCSS
-- **Database**: SQLite at `/app/backend/data/redteam.db` (repository pattern via `db.py` for future PostgreSQL migration)
-- **Job System**: `jobs.py` — wraps long operations (scans, payloads) into async jobs with progress tracking and log streaming
-- **Config**: Strict `.env` validation via `config.py`
-- **Integrations** (all optional): Metasploit RPC (msfrpcd), Sliver C2, Kimi AI (Moonshot K2)
+## Architecture (v7.0 — AI-Driven)
+- **Backend**: FastAPI + SQLite (aiosqlite) + Async Job System + AI Decision Engine
+- **Frontend**: React 19 + TailwindCSS  
+- **Database**: SQLite (repository pattern via `db.py`)
+- **AI Engine**: Kimi K2 (Moonshot) decides next tool after each step, with rule-based fallback
+- **Tools**: All CLI-based (nmap, nuclei, nikto, sqlmap, hydra, msfconsole, etc.)
+- **Metasploit**: Direct CLI (`msfconsole -q -x`) — no msfrpcd needed
 
-## Key Files
-- `/app/backend/server.py` — Main FastAPI app, all API routes
-- `/app/backend/db.py` — SQLite repository layer (tables: jobs, scans, credentials, events, config, chain_executions, custom_tools, custom_modules)
-- `/app/backend/jobs.py` — Async job submission, tracking, cancellation
-- `/app/backend/config.py` — Env validation (APP_MODE, DB_PATH, KIMI_API_KEY, MSF_RPC_*, SLIVER_CONFIG_PATH)
-- `/app/backend/modules/` — Metasploit RPC, Sliver C2, Credential Vault, Session Manager
-- `/app/frontend/src/App.js` — React UI with polling-based scan tracking
-- `/app/install.sh`, `/app/run.sh`, `/app/stop.sh`, `/app/doctor.sh` — Operational scripts
+## Key Changes in v7.0
+- REMOVED: MSF RPC (msfrpcd), Sliver C2, all RPC-dependent modules
+- REMOVED: `/api/msf/sessions`, `/api/sliver/*`, `/api/c2/dashboard`, `/api/metasploit/execute`
+- ADDED: AI-driven scan loop (AI decides each step)
+- ADDED: Nuclei integration (8000+ vulnerability templates)
+- ADDED: `/api/msf/run` (direct CLI commands)
+- CHANGED: Scan flow — AI analyzes after each tool, picks next action
 
-## API Endpoints
-- `GET /api/` — Root info (version, architecture)
-- `GET /api/health` — Fast health check (DB, MSF, Sliver, Listener, active jobs)
-- `GET /api/doctor` — Deep diagnostic (tools, integrations, config warnings, hints)
-- `POST /api/scan/start` — Start adaptive scan (returns scan_id + job_id)
-- `GET /api/scan/{id}/status` — Poll scan progress (in-memory if active, SQLite if completed)
-- `GET /api/scan/{id}/tree` — Attack tree
-- `GET /api/scan/history` — All scans from SQLite
-- `GET /api/scan/{id}/report/pdf` — PDF export
-- `POST /api/jobs/{type}/start` — Generic job start
-- `GET /api/jobs/{id}` — Job status
-- `GET /api/jobs/{id}/logs` — Job log stream
-- `POST /api/jobs/{id}/cancel` — Cancel running job
-- `GET /api/jobs` — List all jobs
-- `GET/PUT /api/config` — Global config (listener_ip, listener_port, etc.)
-- `GET /api/chains` — Attack chain catalog
-- `POST /api/chains/execute` — Execute chain
-- `GET /api/tools` — Tool catalog (expandable)
-- `GET /api/payloads/templates` — Payload generation templates
-- `GET /api/mitre/tactics` — MITRE ATT&CK mapping
-- MSF RPC: `/api/msf/*`
-- Sliver: `/api/sliver/*`
-- C2 Dashboard: `/api/c2/dashboard`
-
-## Completed (April 2026)
-- [x] Full MongoDB → SQLite migration (db.py repository pattern)
-- [x] Async Job system (jobs.py) — scans create jobs, frontend polls status
-- [x] Health/Doctor endpoints
-- [x] Backend rewrite (server.py) — all Motor/pymongo removed
-- [x] Credential vault updated for SQLite
-- [x] Frontend polling with job_id tracking and live job logs
-- [x] Operational scripts: install.sh, run.sh, stop.sh, doctor.sh
-- [x] Docker files cleaned up (docker-compose.yml, DOCKER_DEPLOY.md removed)
-- [x] Testing: 19/19 backend, 9/9 frontend tabs — 100% pass
+## Completed
+- [x] MongoDB → SQLite migration
+- [x] Async Job system
+- [x] Local-first operational scripts (install/run/stop/doctor)
+- [x] Async subprocess (no event loop blocking)
+- [x] AI-driven scan engine (Kimi K2 decides each step)
+- [x] Nuclei integration
+- [x] MSF RPC/Sliver removed — Metasploit as CLI only
+- [x] All tools run as async subprocess
 
 ## Backlog
-- P1: Break App.js into modular components (ScanPanel, ChainPanel, C2Panel, etc.)
-- P1: Add a Logs section that shows real-time job logs in frontend
-- P2: PostgreSQL support via repository pattern swap
-- P2: BloodHound AD paths & multi-target campaigns
-- P2: OpSec/Evasion, payload obfuscation
-- P3: User authentication & role-based access
+- P1: Modularize App.js into components
+- P1: Add real-time AI decision log panel in frontend
+- P2: PostgreSQL support via repository pattern
+- P2: BloodHound AD integration

@@ -2,10 +2,10 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import axios from "axios";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  LayoutDashboard, Crosshair, GitBranch, Link, Radio, Brain, Terminal,
-  Play, Square, Plus, Trash2, RefreshCw, ChevronRight, CheckCircle, XCircle,
-  Zap, Shield, Wifi, Skull, Eye, Activity, Server, Lock, Globe, Copy,
-  Download, Search, Command, MonitorSmartphone, Clock, AlertTriangle, Target,
+  LayoutDashboard, Crosshair, GitBranch, Link, Brain, Terminal,
+  Play, Square, Plus, Trash2, RefreshCw, ChevronRight, CheckCircle,
+  Zap, Shield, Eye, Activity, Lock, Globe, Copy,
+  Download, Search, Clock, AlertTriangle, Target,
   Settings, Save, Package
 } from "lucide-react";
 import { ScrollArea } from "./components/ui/scroll-area";
@@ -28,21 +28,15 @@ function App() {
   const [scanStatus, setScanStatus] = useState(null);
   const [attackTree, setAttackTree] = useState(null);
   const [history, setHistory] = useState([]);
-  const [terminalLines, setTerminalLines] = useState([{ type: "info", text: "RED TEAM FRAMEWORK v6.0 // LOCAL-FIRST // SQLite + Jobs", time: new Date() }]);
+  const [terminalLines, setTerminalLines] = useState([{ type: "info", text: "RED TEAM FRAMEWORK v7.0 // AI-DRIVEN // SQLite + Jobs", time: new Date() }]);
   const [logFilter, setLogFilter] = useState("all");
   const [jobLogs, setJobLogs] = useState([]);
 
-  // Tools & modules
+  // Tools
   const [mitreTactics, setMitreTactics] = useState([]);
-  const [msfModules, setMsfModules] = useState([]);
-  const [recommendedModules, setRecommendedModules] = useState([]);
-  const [moduleSearch, setModuleSearch] = useState("");
-  const [msfCategory, setMsfCategory] = useState("");
 
-  // MSF execution
-  const [msfModule, setMsfModule] = useState(null);
-  const [msfPort, setMsfPort] = useState("");
-  const [msfLhost, setMsfLhost] = useState("");
+  // MSF CLI
+  const [msfCmd, setMsfCmd] = useState("");
   const [msfExecuting, setMsfExecuting] = useState(false);
   const [msfResult, setMsfResult] = useState(null);
 
@@ -54,17 +48,11 @@ function App() {
   const [chainPolling, setChainPolling] = useState(false);
   const [suggestedChains, setSuggestedChains] = useState([]);
 
-  // C2
-  const [c2Dashboard, setC2Dashboard] = useState(null);
-  const [selectedSession, setSelectedSession] = useState(null);
-  const [sessionCmd, setSessionCmd] = useState("");
-  const [sessionOutput, setSessionOutput] = useState([]);
+  // C2 — replaced by MSF CLI + tool status
+  const [toolStatus, setToolStatus] = useState(null);
 
   // AI
   const [aiAnalysis, setAiAnalysis] = useState(null);
-
-  // Autonomous mode
-  const [autonomousMode, setAutonomousMode] = useState(false);
 
   // Global config
   const [globalConfig, setGlobalConfig] = useState({ listener_ip: "", listener_port: 4444, c2_protocol: "tcp", operator_name: "operator", stealth_mode: false, auto_lhost: true });
@@ -94,23 +82,20 @@ function App() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [tacticsRes, chainsRes, modulesRes, historyRes, configRes] = await Promise.all([
+        const [tacticsRes, chainsRes, historyRes, configRes] = await Promise.all([
           axios.get(`${API}/mitre/tactics`),
           axios.get(`${API}/chains`),
-          axios.get(`${API}/metasploit/modules`),
           axios.get(`${API}/scan/history`),
           axios.get(`${API}/config`)
         ]);
         const tacticsObj = tacticsRes.data.tactics || {};
         setMitreTactics(Object.entries(tacticsObj).map(([phase, data]) => ({ phase, ...data })));
         setAttackChains(chainsRes.data.chains || []);
-        setMsfModules(modulesRes.data.modules || []);
         setHistory(historyRes.data || []);
         if (configRes.data) {
           setGlobalConfig(configRes.data);
           if (configRes.data.listener_ip) {
             setChainContext(prev => ({ ...prev, lhost: configRes.data.listener_ip }));
-            setMsfLhost(configRes.data.listener_ip);
           }
         }
       } catch (e) { addLog("error", `Init error: ${e.message}`); }
@@ -156,20 +141,14 @@ function App() {
 
       if (res.data.current_tool) addLog("info", `[${res.data.current_tool}] ${res.data.progress}%`);
 
-      // Fetch job logs for real-time display
-      if (jobId) {
-        try {
-          const logRes = await axios.get(`${API}/jobs/${jobId}/logs?limit=50`);
-          setJobLogs(logRes.data.logs || []);
-        } catch {}
+      // Show AI decisions in real-time
+      const decisions = res.data.ai_decisions || [];
+      if (decisions.length > 0) {
+        const last = decisions[decisions.length - 1];
+        if (last.reasoning && last.source === "ai") {
+          addLog("warning", `[AI] ${last.reasoning}`);
+        }
       }
-
-      // Adaptive log
-      res.data.adaptive_log?.slice(-2).forEach(d => {
-        if (d.decision === "SKIP") addLog("warning", `[ADAPT] SKIP: ${d.reason}`);
-        else if (d.decision === "ADD") addLog("info", `[ADAPT] +TOOL: ${d.reason}`);
-        else if (d.decision === "EXPLOIT") addLog("error", `[ADAPT] AUTO-EXPLOIT: ${d.reason}`);
-      });
 
       if (res.data.status === "completed") {
         clearInterval(pollIntervalRef.current);
@@ -178,19 +157,12 @@ function App() {
         addLog("success", "SCAN COMPLETE");
         setAttackTree(res.data.attack_tree);
         setAiAnalysis(res.data.ai_analysis);
-        if (res.data.suggested_chains?.length) setSuggestedChains(res.data.suggested_chains);
-        if (res.data.recommended_modules?.length) setRecommendedModules(res.data.recommended_modules);
 
         setTargets(prev => prev.map(t => t.scanId === scanId ? { ...t, status: "exploited", results: res.data } : t));
 
         if (res.data.vault_summary) {
           const v = res.data.vault_summary;
           addLog("info", `[VAULT] Creds:${v.total_credentials||0} Sessions:${v.sessions||0}`);
-        }
-
-        // Auto-chain trigger
-        if (autonomousMode && res.data.auto_triggered_chain) {
-          addLog("error", `[AUTO] Triggering chain: ${res.data.auto_triggered_chain.chain_id}`);
         }
       } else if (res.data.status === "error") {
         clearInterval(pollIntervalRef.current);
@@ -251,41 +223,21 @@ function App() {
   };
 
   // C2 functions
-  const loadC2 = async () => {
+  const loadToolStatus = async () => {
     try {
-      const res = await axios.get(`${API}/c2/dashboard`);
-      setC2Dashboard(res.data);
+      const res = await axios.get(`${API}/health`);
+      setToolStatus(res.data.checks);
     } catch (e) { addLog("error", e.message); }
   };
 
-  const runSessionCmd = async () => {
-    if (!selectedSession || !sessionCmd) return;
-    addLog("cmd", `[${selectedSession.source}] ${sessionCmd}`);
-    try {
-      const endpoint = selectedSession.source === "msf" ? `${API}/msf/session/command` : `${API}/sliver/session/exec`;
-      const res = await axios.post(endpoint, { session_id: selectedSession.id, command: sessionCmd });
-      setSessionOutput(prev => [...prev, { cmd: sessionCmd, output: res.data.output || res.data.stdout || "", error: res.data.error || "" }]);
-    } catch (e) { addLog("error", e.message); }
-    setSessionCmd("");
-  };
-
-  // MSF
-  const loadMsfModules = async (search, cat) => {
-    try {
-      const res = await axios.get(`${API}/metasploit/modules`, { params: { search, category: cat } });
-      setMsfModules(res.data.modules || []);
-    } catch (e) {}
-  };
-
-  const executeMsf = async () => {
-    if (!msfModule) return;
+  const runMsfCommand = async () => {
+    if (!msfCmd.trim()) return;
     setMsfExecuting(true);
-    const effectiveLhost = msfLhost || globalConfig.listener_ip;
-    addLog("cmd", `msf > ${msfModule} [LHOST=${effectiveLhost || "NOT SET"}]`);
+    addLog("cmd", `MSF > ${msfCmd}`);
     try {
-      const res = await axios.post(`${API}/metasploit/execute`, { scan_id: currentScan || "manual", node_id: "manual_exec", module: msfModule, target_host: target || "127.0.0.1", target_port: msfPort ? parseInt(msfPort) : null, options: {}, lhost: effectiveLhost, lport: globalConfig.listener_port || 4444 });
+      const res = await axios.post(`${API}/msf/run`, { commands: msfCmd, timeout: 120 });
       setMsfResult(res.data);
-      addLog(res.data.success ? "success" : "error", res.data.success ? "Exploit SUCCESS" : "Exploit FAILED");
+      addLog(res.data.success ? "success" : "info", `MSF: ${res.data.success ? "Session opened!" : "Completed"}`);
     } catch (e) { addLog("error", e.message); }
     setMsfExecuting(false);
   };
@@ -297,10 +249,9 @@ function App() {
       const res = await axios.put(`${API}/config`, globalConfig);
       if (res.data.config) setGlobalConfig(res.data.config);
       addLog("success", `CONFIG SAVED: LHOST=${globalConfig.listener_ip}:${globalConfig.listener_port}`);
-      // Auto-update chain context and MSF
+      // Auto-update chain context
       if (globalConfig.listener_ip) {
         setChainContext(prev => ({ ...prev, lhost: globalConfig.listener_ip }));
-        setMsfLhost(globalConfig.listener_ip);
       }
     } catch (e) { addLog("error", `Config save failed: ${e.message}`); }
     setConfigSaving(false);
@@ -332,9 +283,9 @@ function App() {
     { id: "targets", icon: Crosshair, label: "Targets" },
     { id: "graph", icon: GitBranch, label: "Attack Graph" },
     { id: "chains", icon: Link, label: "Chains" },
-    { id: "c2", icon: Radio, label: "C2" },
+    { id: "msf", icon: Terminal, label: "MSF CLI" },
     { id: "payloads", icon: Package, label: "Payloads" },
-    { id: "ai", icon: Brain, label: "AI" },
+    { id: "ai", icon: Brain, label: "AI Engine" },
     { id: "config", icon: Settings, label: "Config" },
     { id: "logs", icon: Terminal, label: "Logs" },
   ];
@@ -349,7 +300,7 @@ function App() {
             <Shield size={20} className="text-[#FF003C]" />
             <div>
               <div className="text-xs font-bold tracking-[0.2em] text-[#FF003C] uppercase">Red Team</div>
-              <div className="text-[10px] text-[#2F4F38] tracking-wider">APT FRAMEWORK v6.0</div>
+              <div className="text-[10px] text-[#2F4F38] tracking-wider">AI-DRIVEN v7.0</div>
             </div>
           </div>
         </div>
@@ -357,7 +308,7 @@ function App() {
         {/* Nav */}
         <nav className="flex-1 py-2">
           {navItems.map(item => (
-            <div key={item.id} onClick={() => { setActiveSection(item.id); if (item.id === "c2" && !c2Dashboard) loadC2(); if (item.id === "payloads" && payloadTemplates.length === 0) loadPayloads(); }} className={`nav-item ${activeSection === item.id ? "active" : ""}`} data-testid={`nav-${item.id}`}>
+            <div key={item.id} onClick={() => { setActiveSection(item.id); if (item.id === "payloads" && payloadTemplates.length === 0) loadPayloads(); if (item.id === "msf") loadToolStatus(); }} className={`nav-item ${activeSection === item.id ? "active" : ""}`} data-testid={`nav-${item.id}`}>
               <item.icon size={14} />
               <span>{item.label}</span>
             </div>
@@ -366,9 +317,9 @@ function App() {
 
         {/* Autonomous Mode Toggle */}
         <div className="p-3 border-t border-[rgba(0,255,65,0.15)]">
-          <button onClick={() => { setAutonomousMode(!autonomousMode); addLog(autonomousMode ? "warning" : "error", autonomousMode ? "AUTONOMOUS MODE OFF" : "AUTONOMOUS APT ENGAGED"); }} className={`w-full py-3 text-xs font-bold tracking-[0.15em] uppercase cursor-pointer transition-all ${autonomousMode ? "auto-mode-on" : "auto-mode-off"}`} data-testid="toggle-autonomous-mode">
-            {autonomousMode ? <><Activity size={14} className="inline mr-2 animate-pulse" />AUTONOMOUS</> : <><Zap size={14} className="inline mr-2" />ENGAGE AUTO</>}
-          </button>
+          <div className="w-full py-3 text-xs font-bold tracking-[0.15em] uppercase text-center text-[#00FF41] border-t border-[rgba(0,255,65,0.1)]">
+            <Brain size={14} className="inline mr-2" />AI-DRIVEN
+          </div>
         </div>
 
         {/* Status */}
@@ -627,113 +578,39 @@ function App() {
                 )}
 
                 {/* ===== C2 ===== */}
-                {activeSection === "c2" && (
-                  <div className="space-y-3" data-testid="c2-section">
-                    {selectedSession ? (
-                      <div className="space-y-2" data-testid="session-shell">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs text-[#00FF41] font-bold flex items-center gap-2"><Command size={12} /> SESSION: {selectedSession.id}</span>
-                          <button onClick={() => { setSelectedSession(null); setSessionOutput([]); }} className="text-[#2F4F38] hover:text-[#FF003C]"><XCircle size={14} /></button>
+                {activeSection === "msf" && (
+                  <div className="space-y-3" data-testid="msf-section">
+                    <h3 className="text-xs font-bold tracking-[0.15em] uppercase">Metasploit CLI</h3>
+                    <p className="text-[10px] text-[#8BBE95]">Direct msfconsole commands — no msfrpcd needed</p>
+                    <div className="flex gap-1">
+                      <input type="text" value={msfCmd} onChange={e => setMsfCmd(e.target.value)} onKeyDown={e => e.key === "Enter" && runMsfCommand()} placeholder="use exploit/...; set RHOSTS ...; run" className="tac-input flex-1 text-xs font-mono" data-testid="msf-cmd-input" />
+                      <button onClick={runMsfCommand} disabled={msfExecuting} className="tac-btn tac-btn-solid text-[10px]" data-testid="msf-cmd-run">{msfExecuting ? <RefreshCw size={12} className="animate-spin" /> : <Play size={12} />} {msfExecuting ? "RUNNING..." : "EXECUTE"}</button>
+                    </div>
+                    {msfResult && (
+                      <div className="panel" data-testid="msf-result">
+                        <div className="panel-header">
+                          <span className={`text-[10px] ${msfResult.success ? "text-[#00FF41]" : "text-[#FFB000]"}`}>{msfResult.success ? "SESSION OPENED" : "COMPLETED"}</span>
                         </div>
-                        <ScrollArea className="h-64 bg-[#020302] border border-[rgba(0,255,65,0.15)] p-3">
-                          {sessionOutput.map((e, i) => (
-                            <div key={i} className="mb-2">
-                              <div className="text-[10px] text-[#00F0FF] font-mono">$ {e.cmd}</div>
-                              {e.output && <pre className="text-[10px] text-[#00FF41] font-mono whitespace-pre-wrap">{e.output}</pre>}
-                              {e.error && <pre className="text-[10px] text-[#FF003C] font-mono whitespace-pre-wrap">{e.error}</pre>}
-                            </div>
-                          ))}
+                        <ScrollArea className="h-48 p-3">
+                          <pre className="text-[10px] text-[#8BBE95] font-mono whitespace-pre-wrap">{msfResult.output || msfResult.error || "No output"}</pre>
                         </ScrollArea>
-                        <div className="flex gap-1">
-                          <input type="text" value={sessionCmd} onChange={e => setSessionCmd(e.target.value)} onKeyDown={e => e.key === "Enter" && runSessionCmd()} placeholder="command..." className="tac-input flex-1 text-xs" data-testid="session-cmd-input" />
-                          <button onClick={runSessionCmd} className="tac-btn text-[10px]" data-testid="session-cmd-run"><Play size={12} /></button>
-                        </div>
                       </div>
-                    ) : (
-                      <>
-                        <div className="flex items-center justify-between">
-                          <h3 className="text-xs font-bold tracking-[0.15em] uppercase">Command & Control</h3>
-                          <div className="flex gap-2">
-                            <button onClick={async () => { addLog("info", "Reconnecting all C2..."); try { const r = await axios.post(`${API}/c2/reconnect`); loadC2(); addLog("success", `MSF: ${r.data.metasploit?.connected ? "ONLINE" : r.data.metasploit?.error} | Sliver: ${r.data.sliver?.connected ? "ONLINE" : r.data.sliver?.error}`); } catch(e) { addLog("error", e.message); } }} className="tac-btn tac-btn-solid text-[10px]" data-testid="c2-reconnect-btn"><Zap size={12} /> RECONNECT</button>
-                            <button onClick={loadC2} className="tac-btn text-[10px]" data-testid="c2-refresh-btn"><RefreshCw size={12} /></button>
-                          </div>
-                        </div>
-                        {c2Dashboard ? (
-                          <div className="grid grid-cols-2 gap-3">
-                            {/* MSF */}
-                            <div className="panel" data-testid="msf-status-panel">
-                              <div className="panel-header">
-                                <h3 className="flex items-center gap-1"><Skull size={12} className="text-[#FF003C]" /> Metasploit RPC</h3>
-                                <span className={`text-[10px] ${c2Dashboard.metasploit?.connected ? "text-[#00FF41]" : "text-[#FF003C]"}`}>{c2Dashboard.metasploit?.connected ? "ONLINE" : "OFFLINE"}</span>
-                              </div>
-                              <div className="p-3">
-                                {c2Dashboard.metasploit?.connected ? (
-                                  <div className="space-y-2">
-                                    <p className="text-[10px] text-[#8BBE95]">v{c2Dashboard.metasploit.version} // Sessions: {c2Dashboard.metasploit.session_count} // Jobs: {c2Dashboard.metasploit.job_count}</p>
-                                    {(c2Dashboard.metasploit.sessions || []).map((s, i) => (
-                                      <div key={i} onClick={() => setSelectedSession({ ...s, source: "msf" })} className="session-card" data-testid={`msf-session-${s.id}`}>
-                                        <span className="text-[10px] text-[#00FF41]">{s.type} @ {s.target_host}</span>
-                                        <span className="text-[10px] text-[#2F4F38]">{s.via_payload}</span>
-                                      </div>
-                                    ))}
-                                    {c2Dashboard.metasploit.session_count === 0 && <p className="text-[10px] text-[#2F4F38]">No active sessions</p>}
-                                  </div>
-                                ) : (
-                                  <div className="text-[10px] space-y-2">
-                                    <p className="text-[#FF003C]">{c2Dashboard.metasploit?.error || "Not connected"}</p>
-                                    {c2Dashboard.metasploit?.hint && <p className="text-[#FFB000]">{c2Dashboard.metasploit.hint}</p>}
-                                    {c2Dashboard.metasploit?.diagnostics && (
-                                      <div className="bg-[#020302] p-2 space-y-1 border border-[rgba(0,255,65,0.1)]">
-                                        <p className="text-[#2F4F38]">Token set: {c2Dashboard.metasploit.diagnostics.token_set ? "Yes" : "NO"}</p>
-                                        <p className="text-[#2F4F38]">Port reachable: {c2Dashboard.metasploit.diagnostics.port_reachable ? "Yes" : "NO"}</p>
-                                        {c2Dashboard.metasploit.diagnostics.reconnecting && <p className="text-[#FFB000]">Auto-reconnecting (attempt {c2Dashboard.metasploit.diagnostics.retry_count})...</p>}
-                                      </div>
-                                    )}
-                                    <code className="block bg-[#020302] p-2 text-[#00FF41]">msfrpcd -P TOKEN -S -a 127.0.0.1 -p 55553</code>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                            {/* Sliver */}
-                            <div className="panel" data-testid="sliver-status-panel">
-                              <div className="panel-header">
-                                <h3 className="flex items-center gap-1"><Wifi size={12} className="text-[#00F0FF]" /> Sliver C2</h3>
-                                <span className={`text-[10px] ${c2Dashboard.sliver?.connected ? "text-[#00FF41]" : "text-[#FF003C]"}`}>{c2Dashboard.sliver?.connected ? "ONLINE" : "OFFLINE"}</span>
-                              </div>
-                              <div className="p-3">
-                                {c2Dashboard.sliver?.connected ? (
-                                  <div className="space-y-2">
-                                    <p className="text-[10px] text-[#8BBE95]">v{c2Dashboard.sliver.version} // Sessions: {c2Dashboard.sliver.session_count} // Beacons: {c2Dashboard.sliver.beacon_count}</p>
-                                    {(c2Dashboard.sliver.sessions || []).map((s, i) => (
-                                      <div key={i} onClick={() => setSelectedSession({ ...s, source: "sliver" })} className="session-card" data-testid={`sliver-session-${s.id}`}>
-                                        <span className="text-[10px] text-[#00F0FF]">{s.name} @ {s.hostname}</span>
-                                        <span className="text-[10px] text-[#2F4F38]">{s.os}/{s.arch} via {s.transport}</span>
-                                      </div>
-                                    ))}
-                                    {c2Dashboard.sliver.session_count === 0 && <p className="text-[10px] text-[#2F4F38]">No active sessions</p>}
-                                  </div>
-                                ) : (
-                                  <div className="text-[10px] space-y-2">
-                                    <p className="text-[#FF003C]">{c2Dashboard.sliver?.error || "Not connected"}</p>
-                                    {c2Dashboard.sliver?.hint && <p className="text-[#FFB000]">{c2Dashboard.sliver.hint}</p>}
-                                    {c2Dashboard.sliver?.diagnostics && (
-                                      <div className="bg-[#020302] p-2 space-y-1 border border-[rgba(0,255,65,0.1)]">
-                                        <p className="text-[#2F4F38]">Config path: {c2Dashboard.sliver.diagnostics.config_path_raw || "NOT SET"}</p>
-                                        <p className="text-[#2F4F38]">Resolved: {c2Dashboard.sliver.diagnostics.resolved || "N/A"}</p>
-                                        {c2Dashboard.sliver.diagnostics.validation_error && <p className="text-[#FF003C]">{c2Dashboard.sliver.diagnostics.validation_error}</p>}
-                                      </div>
-                                    )}
-                                    <code className="block bg-[#020302] p-2 text-[#00FF41]">sliver-server &amp;&amp; sliver new-operator ...</code>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="text-center py-8 text-[10px] text-[#2F4F38]">Loading C2 status...</div>
-                        )}
-                      </>
                     )}
+                    <div className="panel">
+                      <div className="panel-header"><h3 className="text-[10px]">Quick Commands</h3></div>
+                      <div className="p-3 grid grid-cols-2 gap-2">
+                        {[
+                          { label: "EternalBlue Scan", cmd: "use auxiliary/scanner/smb/smb_ms17_010; set RHOSTS {target}; run" },
+                          { label: "SSH Brute", cmd: "use auxiliary/scanner/ssh/ssh_login; set RHOSTS {target}; set USER_FILE /usr/share/wordlists/metasploit/unix_users.txt; run" },
+                          { label: "HTTP Dir Scan", cmd: "use auxiliary/scanner/http/dir_scanner; set RHOSTS {target}; run" },
+                          { label: "BlueKeep Check", cmd: "use auxiliary/scanner/rdp/cve_2019_0708_bluekeep; set RHOSTS {target}; run" },
+                        ].map((q, i) => (
+                          <button key={i} onClick={() => setMsfCmd(q.cmd.replace("{target}", target || "TARGET"))} className="tac-btn text-[10px] text-left" data-testid={`msf-quick-${i}`}>
+                            {q.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -862,24 +739,6 @@ function App() {
                       </div>
                     ) : (
                       <div className="panel p-8 text-center text-[10px] text-[#2F4F38]">Run a scan to get AI analysis</div>
-                    )}
-
-                    {/* Recommended Modules */}
-                    {recommendedModules.length > 0 && (
-                      <div className="panel" data-testid="recommended-modules-section">
-                        <div className="panel-header"><h3>Recommended Exploits</h3><span className="text-[10px] text-[#2F4F38]">{recommendedModules.length}</span></div>
-                        <div className="p-3 space-y-1">
-                          {recommendedModules.slice(0, 8).map((mod, i) => (
-                            <div key={i} className="flex items-center justify-between py-1 border-b border-[rgba(0,255,65,0.08)] last:border-0">
-                              <div className="flex-1 min-w-0">
-                                <div className="text-[10px] text-[#FF003C] truncate font-mono">{mod.name}</div>
-                                <div className="text-[10px] text-[#2F4F38]">{mod.reasons?.join(", ")}</div>
-                              </div>
-                              <span className="text-[10px] px-1 border border-[#FFB000]/30 text-[#FFB000] ml-2">{mod.relevance_score}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
                     )}
 
                     {/* Suggested Chains */}
