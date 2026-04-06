@@ -16,7 +16,7 @@ KILLED=0
 
 # ─── Phase 1: Kill by PID files ─────────────────────────
 info "Stopping services via PID files..."
-for pidfile in "$PID_DIR"/*.pid 2>/dev/null; do
+for pidfile in "$PID_DIR"/*.pid; do
     [ -f "$pidfile" ] || continue
     pid=$(cat "$pidfile")
     name=$(basename "$pidfile" .pid)
