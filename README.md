@@ -1,4 +1,4 @@
-# Red Team Automation Framework v6.0
+# Red Team Automation Framework v7.0 — AI-Driven
 
 Plataforma de automatización Red Team con arquitectura **Local-First**: SQLite, sistema de Jobs async, orquestación adaptativa, C2 (Metasploit + Sliver), generador de payloads, y análisis AI.
 
