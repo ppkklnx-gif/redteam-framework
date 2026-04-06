@@ -110,7 +110,7 @@ def load_config() -> Config:
     data_dir.mkdir(parents=True, exist_ok=True)
     default_db = str(data_dir / "redteam.db")
 
-    raw_db_path = os.environ.get("DB_PATH", "").strip()
+    raw_db_path = os.environ.get("DB_PATH", "").strip().strip('"').strip("'")
     db_path = raw_db_path if raw_db_path else default_db
 
     cfg = Config(

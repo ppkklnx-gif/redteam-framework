@@ -20,7 +20,7 @@ _msf_reconnect_active = False
 _msf_config = {"token": "", "host": "127.0.0.1", "port": 55553, "ssl": True}
 
 
-def _test_port(host: str, port: int, timeout: float = 5) -> bool:
+def _test_port(host: str, port: int, timeout: float = 2) -> bool:
     """Test if port is open with proper timeout"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

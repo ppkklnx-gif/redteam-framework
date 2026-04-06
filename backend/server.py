@@ -1062,9 +1062,16 @@ async def root():
 @api_router.get("/health")
 async def health():
     db_ok = await repo.is_healthy()
+    try:
+        msf_connected = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, msf_module.is_connected),
+            timeout=2
+        )
+    except Exception:
+        msf_connected = False
     checks = {
         "database": {"engine": "sqlite", "path": config.db_path, "status": "connected" if db_ok else "error"},
-        "msf_rpc": {"host": MSF_RPC_HOST, "port": MSF_RPC_PORT, "token_set": bool(MSF_RPC_TOKEN), "connected": msf_module.is_connected()},
+        "msf_rpc": {"host": MSF_RPC_HOST, "port": MSF_RPC_PORT, "token_set": bool(MSF_RPC_TOKEN), "connected": msf_connected},
         "sliver": {"config_path": SLIVER_CONFIG_PATH, "connected": sliver_module.is_connected()},
         "listener": {"ip": global_config.get("listener_ip", ""), "port": global_config.get("listener_port", 4444), "configured": bool(global_config.get("listener_ip"))},
         "active_jobs": await jobs.list_active(),
@@ -1750,12 +1757,24 @@ import modules.sliver_c2 as sliver_module
 
 @api_router.get("/msf/status")
 async def msf_rpc_status():
-    return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, lambda: msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        return {"connected": False, "error": f"Timeout: {e}"}
 
 @api_router.post("/msf/connect")
 async def msf_rpc_connect():
     msf_module.disconnect_msf()
-    return msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
+    try:
+        return await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, lambda: msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)),
+            timeout=8
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        return {"connected": False, "error": f"Timeout: {e}"}
 
 @api_router.get("/msf/diagnostics")
 async def msf_diagnostics():
@@ -1849,8 +1868,17 @@ async def c2_reconnect_all():
 
 @api_router.get("/c2/dashboard")
 async def c2_dashboard():
-    msf_status = msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)
-    sliver_stat = await sliver_module.get_status(SLIVER_CONFIG_PATH)
+    try:
+        msf_status = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, lambda: msf_module.get_msf_status(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT)),
+            timeout=5
+        )
+    except (asyncio.TimeoutError, Exception):
+        msf_status = {"connected": False, "error": "Timeout connecting to msfrpcd"}
+    try:
+        sliver_stat = await asyncio.wait_for(sliver_module.get_status(SLIVER_CONFIG_PATH), timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        sliver_stat = {"connected": False, "error": "Timeout connecting to Sliver"}
     msf_sessions = msf_module.list_sessions(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
     msf_jobs_list = msf_module.list_jobs(MSF_RPC_TOKEN, MSF_RPC_HOST, MSF_RPC_PORT) if msf_status.get("connected") else []
     sliver_sess = await sliver_module.list_sessions(SLIVER_CONFIG_PATH) if sliver_stat.get("connected") else []
