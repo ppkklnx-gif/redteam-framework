@@ -199,12 +199,54 @@ function App() {
 
   const executeChainAuto = async () => {
     if (!selectedChain || !target) return;
-    addLog("cmd", `CHAIN AUTO-EXECUTE: ${selectedChain.name}`);
+    addLog("cmd", `CHAIN AUTO-EXECUTE: ${selectedChain.name} >> ${target}`);
     try {
       const res = await axios.post(`${API}/chains/execute`, { chain_id: selectedChain.id, target, context: chainContext, auto_execute: true });
       setChainExecution(res.data);
+      addLog("success", `Chain started: ${res.data.total_steps} steps | Job: ${res.data.job_id || 'N/A'}`);
+      // Start polling
+      chainPollRef.current = setInterval(() => pollChainExecution(res.data.execution_id), 3000);
+    } catch (e) { addLog("error", e.message); }
+  };
+
+  const prepareChain = async () => {
+    if (!selectedChain || !target) return;
+    try {
+      const res = await axios.post(`${API}/chains/execute`, { chain_id: selectedChain.id, target, context: chainContext, auto_execute: false });
+      setChainExecution(res.data);
       addLog("success", `Chain prepared: ${res.data.total_steps} steps`);
     } catch (e) { addLog("error", e.message); }
+  };
+
+  const runSingleStep = async (stepId) => {
+    if (!chainExecution) return;
+    addLog("cmd", `Running step ${stepId}...`);
+    try {
+      const res = await axios.post(`${API}/chains/execution/${chainExecution.execution_id}/step/${stepId}/run`);
+      setChainExecution(res.data);
+      const ss = res.data.step_statuses?.[String(stepId)];
+      if (ss) addLog(ss.status === "completed" ? "success" : "warning", `Step ${stepId}: ${ss.status}`);
+    } catch (e) { addLog("error", e.message); }
+  };
+
+  const pollChainExecution = async (execId) => {
+    try {
+      const res = await axios.get(`${API}/chains/execution/${execId}`);
+      setChainExecution(res.data);
+      // Log new entries
+      const logs = res.data.logs || [];
+      if (logs.length > 0) {
+        const last = logs[logs.length - 1];
+        if (last.msg && last.msg !== lastLoggedToolRef.current) {
+          lastLoggedToolRef.current = last.msg;
+          addLog("info", last.msg);
+        }
+      }
+      if (res.data.status === "completed") {
+        clearInterval(chainPollRef.current);
+        addLog("success", "CHAIN COMPLETE");
+      }
+    } catch (e) { /* retry */ }
   };
 
   const loadToolStatus = async () => {
@@ -597,51 +639,90 @@ function App() {
                         {chainExecution && (
                           <div className="panel p-3" data-testid="chain-execution-panel">
                             <div className="flex items-center justify-between mb-2">
-                              <span className="text-[10px] text-[#FFB000] uppercase tracking-wider">{chainExecution.status}</span>
+                              <span className={`text-[10px] uppercase tracking-wider ${chainExecution.status === "completed" ? "text-[#00FF41]" : chainExecution.status === "running" ? "text-[#FFB000] animate-pulse" : "text-[#2F4F38]"}`}>
+                                {chainExecution.status === "running" ? "EXECUTING..." : chainExecution.status === "completed" ? "CHAIN COMPLETE" : chainExecution.status.toUpperCase()}
+                              </span>
                               <span className="text-[10px] text-[#2F4F38]">{chainExecution.progress || 0}%</span>
                             </div>
                             <Progress value={chainExecution.progress || 0} className="h-1 bg-[#0a140a] mb-3" />
                           </div>
                         )}
 
-                        <ScrollArea className="h-48">
+                        <ScrollArea className="h-56">
                           <div className="space-y-1">
                             {(selectedChain.steps || []).map(step => {
-                              const ss = chainExecution?.step_statuses?.[String(step.id)]?.status || "pending";
+                              const ss = chainExecution?.step_statuses?.[String(step.id)] || { status: "pending", results: [] };
+                              const isRunning = ss.status === "running";
+                              const isComplete = ss.status === "completed" || ss.status === "warning";
+                              const isFailed = ss.status === "failed";
                               return (
-                                <div key={step.id} className={`panel p-2 ${ss === "running" ? "animate-pulse" : ""}`} style={{ borderColor: ss === "completed" ? "#00FF41" : ss === "running" ? "#FFB000" : ss === "failed" ? "#FF003C" : undefined }} data-testid={`chain-step-${step.id}`}>
+                                <div key={step.id} className={`panel p-2 ${isRunning ? "animate-pulse" : ""}`} style={{ borderColor: isComplete ? "#00FF41" : isRunning ? "#FFB000" : isFailed ? "#FF003C" : undefined }} data-testid={`chain-step-${step.id}`}>
                                   <div className="flex items-center justify-between">
-                                    <span className="text-[10px] font-bold" style={{ color: ss === "completed" ? "#00FF41" : ss === "running" ? "#FFB000" : "#8BBE95" }}>S{step.id}: {step.name}</span>
-                                    <span className="text-[10px] text-[#2F4F38] uppercase">{ss}</span>
+                                    <span className="text-[10px] font-bold" style={{ color: isComplete ? "#00FF41" : isRunning ? "#FFB000" : isFailed ? "#FF003C" : "#8BBE95" }}>
+                                      S{step.id}: {step.name}
+                                    </span>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] text-[#2F4F38] uppercase">{ss.status}</span>
+                                      {chainExecution && ss.status === "pending" && chainExecution.status === "prepared" && (
+                                        <button onClick={() => runSingleStep(step.id)} className="tac-btn text-[9px] py-0 px-2" data-testid={`run-step-${step.id}`}><Play size={9} /> RUN</button>
+                                      )}
+                                    </div>
                                   </div>
                                   <div className="mt-1 space-y-0.5">
                                     {(step.actions || []).map((a, ai) => (
                                       <div key={ai} className="flex items-center gap-1 text-[10px]">
                                         <span className="text-[#2F4F38] bg-[#020302] px-1 py-0.5 flex-1 truncate font-mono"><span className="text-[#FFB000]">[{a.tool}] </span>{a.cmd}</span>
-                                        <button onClick={() => navigator.clipboard.writeText((a.cmd || "").replace("{target}", target || "TARGET"))} className="text-[#2F4F38] hover:text-[#00FF41]"><Copy size={9} /></button>
+                                        <button onClick={() => navigator.clipboard.writeText(a.cmd)} className="text-[#2F4F38] hover:text-[#00FF41]"><Copy size={9} /></button>
                                       </div>
                                     ))}
                                   </div>
+                                  {/* Show results if step completed */}
+                                  {ss.results && ss.results.length > 0 && (
+                                    <div className="mt-2 space-y-1 border-t border-[rgba(0,255,65,0.1)] pt-1">
+                                      {ss.results.map((r, ri) => (
+                                        <div key={ri} className="text-[9px]">
+                                          <span className={`font-bold ${r.result?.error ? "text-[#FF003C]" : "text-[#00FF41]"}`}>[{r.tool}]</span>
+                                          {r.result?.error && <span className="text-[#FF003C] ml-1">{r.result.error}</span>}
+                                          {r.result?.ports && <span className="text-[#8BBE95] ml-1">{r.result.ports.length} ports</span>}
+                                          {r.result?.findings && <span className="text-[#FFB000] ml-1">{r.result.findings.length} vulns</span>}
+                                          {r.result?.output && !r.result?.ports && !r.result?.findings && (
+                                            <span className="text-[#8BBE95] ml-1 truncate block max-w-full">{r.result.output.substring(0, 200)}...</span>
+                                          )}
+                                          {r.result?.session_opened && <span className="text-[#FF003C] ml-1 font-bold">SESSION OPENED!</span>}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
                                 </div>
                               );
                             })}
                           </div>
                         </ScrollArea>
 
+                        {/* Execution logs */}
+                        {chainExecution?.logs?.length > 0 && (
+                          <div className="panel p-2">
+                            <div className="text-[9px] text-[#2F4F38] uppercase mb-1">Execution Log</div>
+                            <ScrollArea className="h-24">
+                              {chainExecution.logs.map((l, i) => (
+                                <div key={i} className="text-[9px] text-[#8BBE95] font-mono">{l.msg}</div>
+                              ))}
+                            </ScrollArea>
+                          </div>
+                        )}
+
                         <div className="flex gap-2">
                           {!chainExecution ? (
                             <>
-                              <button onClick={async () => {
-                                try {
-                                  const res = await axios.post(`${API}/chains/execute`, { chain_id: selectedChain.id, target, context: chainContext, auto_execute: false });
-                                  setChainExecution(res.data);
-                                  addLog("success", `Chain prepared: ${res.data.total_steps} steps`);
-                                } catch (e) { addLog("error", e.message); }
-                              }} className="tac-btn flex-1 justify-center text-[10px]" disabled={!target} data-testid="prepare-chain-btn">PREPARE (MANUAL)</button>
+                              <button onClick={prepareChain} className="tac-btn flex-1 justify-center text-[10px]" disabled={!target} data-testid="prepare-chain-btn">PREPARE (MANUAL)</button>
                               <button onClick={executeChainAuto} className="tac-btn tac-btn-red flex-1 justify-center text-[10px]" disabled={!target} data-testid="auto-execute-chain-btn"><Zap size={12} /> AUTO-EXECUTE</button>
                             </>
+                          ) : chainExecution.status === "completed" ? (
+                            <div className="w-full p-2 border border-[#00FF41]/50 bg-[rgba(0,255,65,0.05)] text-center text-xs text-[#00FF41]"><CheckCircle size={14} className="inline mr-2" />CHAIN COMPLETE - {chainExecution.progress}%</div>
+                          ) : chainExecution.status === "running" ? (
+                            <div className="w-full p-2 border border-[#FFB000]/50 bg-[rgba(255,176,0,0.05)] text-center text-xs text-[#FFB000] animate-pulse"><RefreshCw size={14} className="inline mr-2 animate-spin" />EXECUTING... Step {chainExecution.current_step}/{chainExecution.total_steps}</div>
                           ) : (
-                            <div className="w-full p-2 border border-[#00FF41]/50 bg-[rgba(0,255,65,0.05)] text-center text-xs text-[#00FF41]"><CheckCircle size={14} className="inline mr-2" />CHAIN PREPARED</div>
+                            <div className="w-full text-center text-[10px] text-[#8BBE95]">Click RUN on each step or close and use AUTO-EXECUTE</div>
                           )}
                         </div>
                       </div>

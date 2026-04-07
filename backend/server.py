@@ -1117,6 +1117,9 @@ async def get_chain_detail(chain_id: str):
     steps = _build_chain_steps(chain_id, chain)
     return {"id": chain_id, **chain, "steps": steps}
 
+# Chain execution tracking (in-memory, like scan_progress)
+chain_executions: Dict[str, Dict] = {}
+
 @api_router.post("/chains/execute")
 async def execute_chain(data: Dict[str, Any]):
     chain_id = data.get("chain_id", "")
@@ -1124,22 +1127,166 @@ async def execute_chain(data: Dict[str, Any]):
     if not chain:
         raise HTTPException(status_code=404, detail="Chain not found")
     target = data.get("target", "")
+    if not target:
+        raise HTTPException(status_code=400, detail="Target required")
     context = data.get("context", {})
+    auto_execute = data.get("auto_execute", False)
     exec_id = str(uuid.uuid4())[:8]
     steps = _build_chain_steps(chain_id, chain)
-    return {
-        "execution_id": exec_id, "chain_id": chain_id, "status": "prepared",
-        "target": target, "total_steps": len(steps), "progress": 0,
-        "steps": steps, "step_statuses": {str(s["id"]): {"status": "pending"} for s in steps}
+
+    # Replace placeholders in commands
+    lhost = context.get("lhost", "LHOST")
+    domain = context.get("domain", "DOMAIN")
+    user = context.get("user", "USER")
+    passwd = context.get("pass", "PASS")
+    for step in steps:
+        for action in step.get("actions", []):
+            cmd = action.get("cmd", "")
+            cmd = cmd.replace("{target}", target).replace("{lhost}", lhost)
+            cmd = cmd.replace("DOMAIN", domain).replace("LHOST", lhost)
+            cmd = cmd.replace("USER", user).replace("PASS", passwd)
+            action["cmd"] = cmd
+
+    exec_data = {
+        "execution_id": exec_id, "chain_id": chain_id, "chain_name": chain["name"],
+        "status": "running" if auto_execute else "prepared",
+        "target": target, "context": context,
+        "total_steps": len(steps), "current_step": 0, "progress": 0,
+        "steps": steps,
+        "step_statuses": {str(s["id"]): {"status": "pending", "results": []} for s in steps},
+        "logs": [], "started_at": datetime.now(timezone.utc).isoformat()
     }
+    chain_executions[exec_id] = exec_data
+
+    if auto_execute:
+        job = await jobs.submit("chain_execute", chain_job_handler, target=target,
+            params={"exec_id": exec_id, "chain_id": chain_id, "context": context})
+        exec_data["job_id"] = job["job_id"]
+
+    return exec_data
 
 @api_router.get("/chains/execution/{exec_id}")
 async def get_chain_execution(exec_id: str):
-    return {"execution_id": exec_id, "status": "prepared", "progress": 0}
+    ex = chain_executions.get(exec_id)
+    if not ex:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return ex
 
-@api_router.post("/chains/execution/{exec_id}/step/{step_id}")
-async def run_chain_step(exec_id: str, step_id: str):
-    return {"execution_id": exec_id, "step_id": step_id, "status": "completed"}
+@api_router.post("/chains/execution/{exec_id}/step/{step_id}/run")
+async def run_single_chain_step(exec_id: str, step_id: str):
+    """Manually run a single step of a chain."""
+    ex = chain_executions.get(exec_id)
+    if not ex:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    target = ex["target"]
+    step = None
+    for s in ex["steps"]:
+        if str(s["id"]) == step_id:
+            step = s
+            break
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    ex["step_statuses"][step_id]["status"] = "running"
+    results = []
+    for action in step.get("actions", []):
+        tool_name = action.get("tool", "")
+        cmd = action.get("cmd", "")
+        ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": f"[S{step_id}] Running: {tool_name} -> {cmd}"})
+
+        if tool_name in RED_TEAM_TOOLS:
+            result = await run_tool(tool_name, target)
+        elif tool_name == "msfconsole":
+            result = await run_msfconsole(cmd, target)
+        else:
+            try:
+                proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+                output = (stdout.decode(errors='replace') if stdout else '') + (stderr.decode(errors='replace') if stderr else '')
+                result = {"output": output, "exit_code": proc.returncode, "tool": tool_name, "command": cmd}
+            except asyncio.TimeoutError:
+                result = {"error": f"Timeout running {tool_name}", "tool": tool_name}
+            except FileNotFoundError:
+                result = {"error": f"{tool_name} not installed", "tool": tool_name, "simulated": True}
+            except Exception as e:
+                result = {"error": str(e), "tool": tool_name}
+
+        results.append({"tool": tool_name, "result": result})
+        ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": f"[S{step_id}] {tool_name}: {'OK' if not result.get('error') else result['error']}"})
+
+    has_error = any(r["result"].get("error") for r in results)
+    ex["step_statuses"][step_id] = {"status": "failed" if has_error else "completed", "results": results}
+
+    # Update progress
+    completed = sum(1 for ss in ex["step_statuses"].values() if ss["status"] in ("completed", "failed", "skipped"))
+    ex["progress"] = int((completed / ex["total_steps"]) * 100)
+    ex["current_step"] = int(step_id)
+
+    if completed >= ex["total_steps"]:
+        ex["status"] = "completed"
+        ex["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    return ex
+
+
+async def chain_job_handler(job_id: str, target: str, params: Dict):
+    """Auto-execute all steps of a chain sequentially."""
+    exec_id = params["exec_id"]
+    ex = chain_executions.get(exec_id)
+    if not ex:
+        return {"error": "Execution not found"}
+
+    ex["status"] = "running"
+    await repo.job_log(job_id, "info", f"Chain auto-execute started: {ex['chain_name']}", module="chain")
+
+    for step in ex["steps"]:
+        step_id = str(step["id"])
+        ex["step_statuses"][step_id]["status"] = "running"
+        ex["current_step"] = step["id"]
+        step_results = []
+
+        await repo.job_log(job_id, "info", f"Step {step_id}: {step['name']}", module="chain")
+        ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": f">>> STEP {step_id}: {step['name']}"})
+
+        for action in step.get("actions", []):
+            tool_name = action.get("tool", "")
+            cmd = action.get("cmd", "")
+            ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": f"  [{tool_name}] {cmd}"})
+            await repo.job_log(job_id, "info", f"  Running {tool_name}: {cmd}", module="chain")
+
+            if tool_name in RED_TEAM_TOOLS:
+                result = await run_tool(tool_name, target)
+            elif tool_name == "msfconsole":
+                result = await run_msfconsole(cmd, target)
+            else:
+                try:
+                    proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+                    output = (stdout.decode(errors='replace') if stdout else '') + (stderr.decode(errors='replace') if stderr else '')
+                    result = {"output": output, "exit_code": proc.returncode, "tool": tool_name, "command": cmd}
+                except asyncio.TimeoutError:
+                    result = {"error": f"Timeout ({tool_name})", "tool": tool_name}
+                except FileNotFoundError:
+                    result = {"error": f"{tool_name} not installed", "tool": tool_name, "simulated": True}
+                except Exception as e:
+                    result = {"error": str(e), "tool": tool_name}
+
+            step_results.append({"tool": tool_name, "result": result})
+            status_msg = "OK" if not result.get("error") else f"ERR: {result['error']}"
+            ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": f"  [{tool_name}] {status_msg}"})
+
+        has_error = any(r["result"].get("error") and not r["result"].get("simulated") for r in step_results)
+        ex["step_statuses"][step_id] = {"status": "completed" if not has_error else "warning", "results": step_results}
+
+        completed = sum(1 for ss in ex["step_statuses"].values() if ss["status"] in ("completed", "warning", "failed", "skipped"))
+        ex["progress"] = int((completed / ex["total_steps"]) * 100)
+        await repo.job_update(job_id, progress=ex["progress"])
+
+    ex["status"] = "completed"
+    ex["finished_at"] = datetime.now(timezone.utc).isoformat()
+    ex["logs"].append({"time": datetime.now(timezone.utc).isoformat(), "msg": ">>> CHAIN COMPLETE"})
+    await repo.job_log(job_id, "info", "Chain execution completed", module="chain")
+    return {"execution_id": exec_id, "status": "completed", "progress": 100}
 
 def _build_chain_steps(chain_id: str, chain: Dict) -> list:
     """Generate actionable steps for a chain."""
