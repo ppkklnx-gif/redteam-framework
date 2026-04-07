@@ -51,6 +51,8 @@ function App() {
   const pollIntervalRef = useRef(null);
   const chainPollRef = useRef(null);
   const terminalRef = useRef(null);
+  const lastLoggedToolRef = useRef("");
+  const lastLoggedDecisionRef = useRef(0);
 
   const addLog = useCallback((type, text) => {
     setTerminalLines(prev => [...prev.slice(-200), { type, text, time: new Date() }]);
@@ -94,6 +96,8 @@ function App() {
     if (!t.trim()) return;
     setIsScanning(true);
     addLog("cmd", `ENGAGE >> ${t}`);
+    lastLoggedToolRef.current = "";
+    lastLoggedDecisionRef.current = 0;
     try {
       const res = await axios.post(`${API}/scan/start`, { target: t, scan_phases: selectedPhases, tools: [] });
       setCurrentScanId(res.data.scan_id);
@@ -116,11 +120,22 @@ function App() {
     try {
       const res = await axios.get(`${API}/scan/${scanId}/status`);
       setScanStatus(res.data);
-      if (res.data.current_tool && res.data.current_tool !== "ai_thinking") addLog("info", `[${res.data.current_tool}] ${res.data.progress}%`);
+
+      // Only log when tool or progress CHANGES
+      const toolKey = `${res.data.current_tool}-${res.data.progress}`;
+      if (res.data.current_tool && res.data.current_tool !== "ai_thinking" && toolKey !== lastLoggedToolRef.current) {
+        lastLoggedToolRef.current = toolKey;
+        addLog("info", `[${res.data.current_tool}] ${res.data.progress}%`);
+      }
+
+      // Only log NEW AI decisions
       const decisions = res.data.ai_decisions || [];
-      if (decisions.length > 0) {
-        const last = decisions[decisions.length - 1];
-        if (last.reasoning) addLog("warning", `[AI] ${last.reasoning}`);
+      if (decisions.length > lastLoggedDecisionRef.current) {
+        for (let i = lastLoggedDecisionRef.current; i < decisions.length; i++) {
+          const d = decisions[i];
+          if (d.reasoning) addLog("warning", `[AI] ${d.reasoning}`);
+        }
+        lastLoggedDecisionRef.current = decisions.length;
       }
       if (res.data.status === "completed") {
         clearInterval(pollIntervalRef.current);
