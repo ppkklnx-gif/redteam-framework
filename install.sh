@@ -70,36 +70,39 @@ ENV_FILE="$BACKEND_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
     info "Creating default .env..."
     cat > "$ENV_FILE" <<'ENVEOF'
-MONGO_URL="mongodb://localhost:27017"
-DB_NAME="redteam"
 KIMI_API_KEY=""
-MSF_RPC_TOKEN=""
-MSF_RPC_HOST="127.0.0.1"
-MSF_RPC_PORT="55553"
-SLIVER_CONFIG_PATH=""
 DB_PATH=""
 APP_MODE="local"
 LOG_LEVEL="INFO"
 ENVEOF
-    warn "Created .env with defaults. Edit $ENV_FILE to set KIMI_API_KEY, MSF_RPC_TOKEN, etc."
+    warn "Created .env — Edit $ENV_FILE to set your KIMI_API_KEY (Moonshot AI)"
 else
     ok ".env already exists"
 fi
 
 # ─── Frontend Dependencies ───────────────────────────────
 info "Installing frontend dependencies..."
-if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
-    cd "$FRONTEND_DIR"
-    if command -v yarn &>/dev/null; then
-        yarn install --silent 2>/dev/null
-    else
-        npm install --silent 2>/dev/null
-    fi
-    cd "$SCRIPT_DIR"
+cd "$FRONTEND_DIR"
+
+# Always nuke old node_modules to prevent stale cache issues
+if [ -d "node_modules" ]; then
+    warn "Removing old node_modules (prevents cache bugs)..."
+    rm -rf node_modules package-lock.json
+fi
+
+info "Running npm install (this may take 2-3 minutes)..."
+if npm install 2>&1; then
     ok "Frontend packages installed"
 else
-    ok "Frontend node_modules already present"
+    warn "npm install had issues, retrying with --legacy-peer-deps..."
+    npm install --legacy-peer-deps 2>&1
+    if [ $? -eq 0 ]; then
+        ok "Frontend packages installed (legacy mode)"
+    else
+        err "Frontend install failed. Run manually: cd frontend && npm install --legacy-peer-deps"
+    fi
 fi
+cd "$SCRIPT_DIR"
 
 # ─── Frontend .env ───────────────────────────────────────
 FE_ENV="$FRONTEND_DIR/.env"

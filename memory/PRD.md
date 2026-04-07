@@ -10,6 +10,7 @@ Automated Red Team / pentesting framework with **AI-driven** adaptive scanning. 
 - **AI Engine**: Kimi K2 (Moonshot) decides next tool after each step, with rule-based fallback
 - **Tools**: All CLI-based (nmap, nuclei, nikto, sqlmap, hydra, msfconsole, etc.)
 - **Metasploit**: Direct CLI (`msfconsole -q -x`) — no msfrpcd needed
+- **Deployment**: Local-First on Kali Linux. NO Docker needed.
 
 ## Key Changes in v7.0
 - REMOVED: MSF RPC (msfrpcd), Sliver C2, all RPC-dependent modules
@@ -20,7 +21,7 @@ Automated Red Team / pentesting framework with **AI-driven** adaptive scanning. 
 - CHANGED: Scan flow — AI analyzes after each tool, picks next action
 
 ## Completed
-- [x] MongoDB → SQLite migration
+- [x] MongoDB -> SQLite migration
 - [x] Async Job system
 - [x] Local-first operational scripts (install/run/stop/doctor)
 - [x] Async subprocess (no event loop blocking)
@@ -28,9 +29,12 @@ Automated Red Team / pentesting framework with **AI-driven** adaptive scanning. 
 - [x] Nuclei integration
 - [x] MSF RPC/Sliver removed — Metasploit as CLI only
 - [x] All tools run as async subprocess
+- [x] Fixed NPM peer dependency conflicts (date-fns, eslint, react-day-picker, react-flow-renderer)
+- [x] Updated install.sh with robust npm handling (auto-retry, no silent errors)
+- [x] Cleaned unused dependencies (react-flow-renderer, react-force-graph-2d, react-router-dom, recharts)
 
 ## Backlog
-- P1: Modularize App.js into components
+- P1: Modularize App.js into components (904 lines -> separate files)
 - P1: Add real-time AI decision log panel in frontend
 - P2: PostgreSQL support via repository pattern
 - P2: BloodHound AD integration
